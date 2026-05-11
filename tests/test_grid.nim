@@ -441,3 +441,96 @@ suite "grid: malformed input is terminal-like":
     let g = newGrid()
     g.feed("\x1b[?2026hX\x1b[?2026l")
     check g.rowText(0) == "X"
+
+suite "grid: scroll regions":
+  test "CSI r sets region and linefeed scrolls only that region":
+    let g = newGrid()
+    g.height = 5
+    g.feed("a\nb\nc\nd\ne")
+    g.feed("\x1b[2;4r")
+    g.feed("\x1b[4;1H")
+    g.feed("\n")
+    check g.rowText(0) == "a"
+    check g.rowText(1) == "c"
+    check g.rowText(2) == "d"
+    check g.rowText(3) == ""
+    check g.rowText(4) == "e"
+    check g.row == 3
+    check g.col == 0
+
+  test "empty CSI r resets region to full screen":
+    let g = newGrid()
+    g.height = 3
+    g.feed("\x1b[2;3r")
+    check g.scrollTop == 1
+    check g.scrollBottom == 2
+    g.feed("\x1b[r")
+    check g.scrollTop == 0
+    check g.scrollBottom == 0
+
+suite "grid: insert and delete lines":
+  test "CSI L inserts blank lines inside scroll region":
+    let g = newGrid()
+    g.height = 5
+    g.feed("a\nb\nc\nd\ne")
+    g.feed("\x1b[2;5r")
+    g.feed("\x1b[3;1H")
+    g.feed("\x1b[L")
+    check g.rowText(0) == "a"
+    check g.rowText(1) == "b"
+    check g.rowText(2) == ""
+    check g.rowText(3) == "c"
+    check g.rowText(4) == "d"
+
+  test "CSI M deletes lines inside scroll region":
+    let g = newGrid()
+    g.height = 5
+    g.feed("a\nb\nc\nd\ne")
+    g.feed("\x1b[2;5r")
+    g.feed("\x1b[3;1H")
+    g.feed("\x1b[M")
+    check g.rowText(0) == "a"
+    check g.rowText(1) == "b"
+    check g.rowText(2) == "d"
+    check g.rowText(3) == "e"
+    check g.rowText(4) == ""
+
+  test "insert line outside scroll region is ignored":
+    let g = newGrid()
+    g.height = 4
+    g.feed("a\nb\nc\nd")
+    g.feed("\x1b[2;3r")
+    g.feed("\x1b[1;1H")
+    g.feed("\x1b[L")
+    check g.rowText(0) == "a"
+    check g.rowText(1) == "b"
+    check g.rowText(2) == "c"
+    check g.rowText(3) == "d"
+
+suite "grid: insert and delete characters":
+  test "CSI @ inserts blanks at cursor and truncates at width":
+    let g = newGrid()
+    g.width = 6
+    g.feed("abcdef")
+    g.feed("\x1b[1;3H")
+    g.feed("\x1b[2@")
+    check g.rowText(0) == "ab  cd"
+    check g.col == 2
+
+  test "CSI P deletes characters and fills to width":
+    let g = newGrid()
+    g.width = 6
+    g.feed("abcdef")
+    g.feed("\x1b[1;3H")
+    g.feed("\x1b[2P")
+    check g.rowText(0) == "abef  "
+    check g.col == 2
+
+suite "grid: bracketed paste mode":
+  test "CSI ?2004 h/l toggles bracketed paste state":
+    let g = newGrid()
+    check not g.bracketedPaste
+    g.feed("\x1b[?2004h")
+    check g.bracketedPaste
+    g.feed("\x1b[?2004l")
+    check not g.bracketedPaste

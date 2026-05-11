@@ -160,6 +160,16 @@ g.feed "\x1b[?25h"
 check not g.cursorHidden
 ```
 
+Bracketed paste mode state is tracked too:
+
+```nim
+g.feed "\x1b[?2004h"
+check g.bracketedPaste
+
+g.feed "\x1b[?2004l"
+check not g.bracketedPaste
+```
+
 ## Erasing
 
 Line erase:
@@ -180,6 +190,49 @@ g.feed "\x1b[2J"  # clear display
 
 These operations update the grid, not just the visible text string, so later
 cell assertions still reflect the new screen state.
+
+## Scroll Regions And In-Place Edits
+
+REPLs with bottom-pinned status rows often rely on terminal scroll regions and
+line insertion/deletion. `ttty` models the common CSI forms:
+
+```nim
+let g = newGrid()
+g.height = 5
+g.feed "a\nb\nc\nd\ne"
+
+g.feed "\x1b[2;4r"  # scrolling region: rows 2..4, 1-based
+g.feed "\x1b[4;1H"  # move to region bottom
+g.feed "\n"         # scrolls only rows 2..4
+
+check rowText(g, 0) == "a"
+check rowText(g, 4) == "e"
+```
+
+Reset the scroll region with `CSI r`:
+
+```nim
+g.feed "\x1b[r"
+```
+
+Insert and delete lines:
+
+```nim
+g.feed "\x1b[L"   # insert one blank line at cursor row
+g.feed "\x1b[2L"  # insert two blank lines
+g.feed "\x1b[M"   # delete one line at cursor row
+g.feed "\x1b[2M"  # delete two lines
+```
+
+Insert and delete characters:
+
+```nim
+g.feed "\x1b[2@"  # insert two blank cells at cursor column
+g.feed "\x1b[2P"  # delete two cells at cursor column
+```
+
+When `width` is set, character insertion truncates at the right edge and
+character deletion fills to the right edge with blanks.
 
 ## Styles And Colors
 
@@ -326,6 +379,9 @@ Currently modeled:
 - line/display erase
 - save/restore cursor
 - cursor visibility
+- bracketed paste mode state
+- scroll regions
+- insert/delete line and insert/delete character
 - SGR attributes, 16-color, 256-color, RGB marker
 - optional width, wrapping, terminal height, and scrollback
 - wide glyphs and combining marks
@@ -333,17 +389,16 @@ Currently modeled:
 Not currently modeled:
 
 - alternate screen buffers
-- insert/delete line and insert/delete character
-- origin mode, scroll regions, margins
+- origin mode and margins beyond scroll regions
 - OSC sequences
-- bracketed paste mode state
 - mouse tracking
 - exact Unicode version and East Asian Ambiguous width policy
 - RGB component storage
 
-For enhanced REPLs, the next useful additions are likely scroll regions,
-insert/delete line, and bracketed paste mode state. Those features affect
-bottom-pinned bars and prompts more often than obscure terminal modes do.
+For enhanced REPLs, the next useful additions are likely alternate screen,
+origin mode, and OSC title/clipboard handling if your UI starts emitting them.
+For bottom-pinned bars and prompts, scroll regions and insert/delete operations
+are already modeled.
 
 ## Design Notes
 

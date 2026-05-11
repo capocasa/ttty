@@ -51,10 +51,13 @@ type
     height*: int
     scrollback*: int
     tabWidth*: int
+    scrollTop*: int
+    scrollBottom*: int
     pendingWrap*: bool
     savedRow*, savedCol*: int
     hasSaved*: bool
     cursorHidden*: bool
+    bracketedPaste*: bool
     curFg*: Color
     curBg*: Color
     curFgIdx*: uint8
@@ -79,9 +82,10 @@ proc newCell*(rune: Rune = Rune(' '), fg: Color = colDefault,
 proc newGrid*(): Grid =
   Grid(rows: @[newSeq[Cell]()],
        row: 0, col: 0, width: 0, height: 0, scrollback: 0, tabWidth: 8,
+       scrollTop: 0, scrollBottom: 0,
        pendingWrap: false,
        savedRow: 0, savedCol: 0,
-       hasSaved: false, cursorHidden: false,
+       hasSaved: false, cursorHidden: false, bracketedPaste: false,
        curFg: colDefault, curBg: colDefault, curAttrs: SgrAttr(0))
 
 proc blankCell(g: Grid): Cell =
@@ -92,6 +96,25 @@ proc blankCell(g: Grid): Cell =
 proc ensureRow*(g: Grid, r: int) =
   while g.rows.len <= r:
     g.rows.add newSeq[Cell]()
+
+proc blankRow(): seq[Cell] =
+  newSeq[Cell]()
+
+proc scrollBottomDefault(g: Grid): int =
+  if g.scrollBottom > 0:
+    g.scrollBottom
+  elif g.height > 0:
+    g.height - 1
+  else:
+    max(0, g.rows.len - 1)
+
+proc scrollBounds(g: Grid): (int, int) =
+  let top = max(0, g.scrollTop)
+  let bottom = max(top, scrollBottomDefault(g))
+  (top, bottom)
+
+proc ensureThrough(g: Grid, bottom: int) =
+  ensureRow(g, bottom)
 
 proc padTo(row: var seq[Cell], col: int, fg: Color, bg: Color,
            fi, bi: uint8, attrs: SgrAttr) =
@@ -111,8 +134,27 @@ proc trimScrollback(g: Grid) =
       else:
         g.hasSaved = false
 
+proc scrollRegionUp(g: Grid, top, bottom, n: int) =
+  ensureThrough(g, bottom)
+  let count = min(max(0, n), bottom - top + 1)
+  for _ in 0 ..< count:
+    g.rows.delete(top)
+    g.rows.insert(blankRow(), bottom)
+
+proc scrollRegionDown(g: Grid, top, bottom, n: int) =
+  ensureThrough(g, bottom)
+  let count = min(max(0, n), bottom - top + 1)
+  for _ in 0 ..< count:
+    g.rows.delete(bottom)
+    g.rows.insert(blankRow(), top)
+
 proc lineFeed(g: Grid) =
-  inc g.row
+  let (top, bottom) = scrollBounds(g)
+  if (g.scrollTop > 0 or g.scrollBottom > 0) and g.row == bottom and
+      g.row >= top:
+    scrollRegionUp(g, top, bottom, 1)
+  else:
+    inc g.row
   g.col = 0
   g.pendingWrap = false
   ensureRow(g, g.row)
@@ -226,6 +268,13 @@ proc parseN(s: string): int =
   if s.len == 0: return 1
   try: max(1, parseInt(s))
   except ValueError: 1
+
+proc parseParams(params: string): seq[int] =
+  for part in params.split(';'):
+    result.add parseIntDefault(part, 0)
+
+proc paramAt(params: seq[int], idx, default: int): int =
+  if idx < params.len and params[idx] > 0: params[idx] else: default
 
 proc parseSgrParam(s: string): int =
   if s.len == 0: 0 else: parseIntDefault(s, -1)
@@ -350,6 +399,62 @@ proc backspace(g: Grid) =
   if g.col > 0:
     dec g.col
 
+proc insertChars(g: Grid, n: int) =
+  ensureRow(g, g.row)
+  let count = max(1, n)
+  padTo(g.rows[g.row], g.col, g.curFg, g.curBg, g.curFgIdx, g.curBgIdx,
+        g.curAttrs)
+  for _ in 0 ..< count:
+    g.rows[g.row].insert(blankCell(g), g.col)
+  if g.width > 0 and g.rows[g.row].len > g.width:
+    g.rows[g.row].setLen(g.width)
+  g.pendingWrap = false
+
+proc deleteChars(g: Grid, n: int) =
+  ensureRow(g, g.row)
+  let count = max(1, n)
+  for _ in 0 ..< count:
+    if g.col < g.rows[g.row].len:
+      g.rows[g.row].delete(g.col)
+  if g.width > 0:
+    while g.rows[g.row].len < g.width:
+      g.rows[g.row].add blankCell(g)
+  g.pendingWrap = false
+
+proc insertLines(g: Grid, n: int) =
+  let (top, bottom) = scrollBounds(g)
+  if g.row < top or g.row > bottom: return
+  scrollRegionDown(g, g.row, bottom, max(1, n))
+  g.pendingWrap = false
+
+proc deleteLines(g: Grid, n: int) =
+  let (top, bottom) = scrollBounds(g)
+  if g.row < top or g.row > bottom: return
+  scrollRegionUp(g, g.row, bottom, max(1, n))
+  g.pendingWrap = false
+
+proc setScrollRegion(g: Grid, params: string) =
+  if params.len == 0:
+    g.scrollTop = 0
+    g.scrollBottom = 0
+    g.row = 0
+    g.col = 0
+    g.pendingWrap = false
+    return
+  let ps = parseParams(params)
+  let top = paramAt(ps, 0, 1) - 1
+  let bottomDefault = if g.height > 0: g.height else: max(1, g.rows.len)
+  let bottom = paramAt(ps, 1, bottomDefault) - 1
+  if bottom > top:
+    g.scrollTop = max(0, top)
+    g.scrollBottom = max(g.scrollTop, bottom)
+  else:
+    g.scrollTop = 0
+    g.scrollBottom = 0
+  g.row = 0
+  g.col = 0
+  g.pendingWrap = false
+
 proc feed*(g: Grid, bytes: string) =
   var i = 0
   while i < bytes.len:
@@ -385,8 +490,13 @@ proc feed*(g: Grid, bytes: string) =
           if params == "25":
             if final == 'l': g.cursorHidden = true
             elif final == 'h': g.cursorHidden = false
+          elif params == "2004":
+            if final == 'h': g.bracketedPaste = true
+            elif final == 'l': g.bracketedPaste = false
         else:
           case final
+          of '@':
+            insertChars(g, parseN(params))
           of 'A':
             g.row = max(0, g.row - parseN(params))
             g.pendingWrap = false
@@ -412,8 +522,16 @@ proc feed*(g: Grid, bytes: string) =
             if params.len > 0:
               mode = parseIntDefault(params, 0)
             eraseDisplay(g, mode)
+          of 'L':
+            insertLines(g, parseN(params))
+          of 'M':
+            deleteLines(g, parseN(params))
+          of 'P':
+            deleteChars(g, parseN(params))
           of 'm':
             applySgr(g, params)
+          of 'r':
+            setScrollRegion(g, params)
           of 's':
             g.savedRow = g.row
             g.savedCol = g.col

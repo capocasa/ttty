@@ -1,0 +1,8 @@
+# Build artifacts
+/nimcache/
+/build/
+*.exe
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,4 +1,5 @@
 import std/unittest
+import std/unicode
 import ttty/grid
 
 suite "grid: plain text":
@@ -163,7 +164,7 @@ suite "grid: cursor visibility":
     check g.cursorHidden == false
 
 suite "grid: SGR passthrough":
-  test "SGR sequences are silently consumed":
+  test "SGR sequences do not affect text":
     let g = newGrid()
     g.feed("\x1b[1;31mred\x1b[0m")
     check g.rowText(0) == "red"
@@ -173,6 +174,157 @@ suite "grid: SGR passthrough":
     let g = newGrid()
     g.feed("\x1b[m")
     check g.rowText(0) == ""
+
+suite "grid: SGR attribute tracking":
+  test "bold attribute":
+    let g = newGrid()
+    g.feed("\x1b[1mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saBold)
+
+  test "dim attribute":
+    let g = newGrid()
+    g.feed("\x1b[2mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saDim)
+
+  test "italic attribute":
+    let g = newGrid()
+    g.feed("\x1b[3mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saItalic)
+
+  test "underline attribute":
+    let g = newGrid()
+    g.feed("\x1b[4mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saUnderline)
+
+  test "blink attribute":
+    let g = newGrid()
+    g.feed("\x1b[5mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saBlink)
+
+  test "blink attribute (fast blink code 6)":
+    let g = newGrid()
+    g.feed("\x1b[6mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saBlink)
+
+  test "reverse attribute":
+    let g = newGrid()
+    g.feed("\x1b[7mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saReverse)
+
+  test "strikethrough attribute":
+    let g = newGrid()
+    g.feed("\x1b[9mX")
+    check g.cellAt(0, 0).attrs.hasAttr(saStrikethrough)
+
+  test "reset clears all attributes":
+    let g = newGrid()
+    g.feed("\x1b[1;3;4mX\x1b[0mY")
+    check g.cellAt(0, 0).attrs.hasAttr(saBold)
+    check g.cellAt(0, 0).attrs.hasAttr(saItalic)
+    check g.cellAt(0, 0).attrs.hasAttr(saUnderline)
+    check not g.cellAt(0, 1).attrs.hasAttr(saBold)
+    check not g.cellAt(0, 1).attrs.hasAttr(saItalic)
+    check not g.cellAt(0, 1).attrs.hasAttr(saUnderline)
+
+  test "turning off individual attributes":
+    let g = newGrid()
+    g.feed("\x1b[1;3mX\x1b[23mY")
+    check g.cellAt(0, 0).attrs.hasAttr(saBold)
+    check g.cellAt(0, 0).attrs.hasAttr(saItalic)
+    check g.cellAt(0, 1).attrs.hasAttr(saBold)
+    check not g.cellAt(0, 1).attrs.hasAttr(saItalic)
+
+  test "22 turns off bold and dim":
+    let g = newGrid()
+    g.feed("\x1b[1;2mX\x1b[22mY")
+    check g.cellAt(0, 0).attrs.hasAttr(saBold)
+    check g.cellAt(0, 0).attrs.hasAttr(saDim)
+    check not g.cellAt(0, 1).attrs.hasAttr(saBold)
+    check not g.cellAt(0, 1).attrs.hasAttr(saDim)
+
+  test "multiple attributes stack":
+    let g = newGrid()
+    g.feed("\x1b[1;3;4;5;7;9mX")
+    let a = g.cellAt(0, 0).attrs
+    check a.hasAttr(saBold)
+    check a.hasAttr(saItalic)
+    check a.hasAttr(saUnderline)
+    check a.hasAttr(saBlink)
+    check a.hasAttr(saReverse)
+    check a.hasAttr(saStrikethrough)
+
+  test "attributes apply to new cells only":
+    let g = newGrid()
+    g.feed("A")
+    g.feed("\x1b[1mB")
+    check not g.cellAt(0, 0).attrs.hasAttr(saBold)
+    check g.cellAt(0, 1).attrs.hasAttr(saBold)
+
+suite "grid: SGR color tracking":
+  test "standard 16-color fg (30-37)":
+    for i in 0..7:
+      let g = newGrid()
+      g.feed("\x1b[" & $(30 + i) & "mX")
+      check g.cellFg(0, 0) == Color(1 + i)
+
+  test "standard 16-color bg (40-47)":
+    for i in 0..7:
+      let g = newGrid()
+      g.feed("\x1b[" & $(40 + i) & "mX")
+      check g.cellBg(0, 0) == Color(1 + i)
+
+  test "bright fg (90-97)":
+    for i in 0..7:
+      let g = newGrid()
+      g.feed("\x1b[" & $(90 + i) & "mX")
+      check g.cellFg(0, 0) == Color(9 + i)
+
+  test "bright bg (100-107)":
+    for i in 0..7:
+      let g = newGrid()
+      g.feed("\x1b[" & $(100 + i) & "mX")
+      check g.cellBg(0, 0) == Color(9 + i)
+
+  test "256-color fg via 38;5;n":
+    let g = newGrid()
+    g.feed("\x1b[38;5;244mX")
+    let c = g.cellAt(0, 0)
+    check c.fgColor == col256
+    check c.fgColorIdx == 244
+
+  test "256-color bg via 48;5;n":
+    let g = newGrid()
+    g.feed("\x1b[48;5;100mX")
+    let c = g.cellAt(0, 0)
+    check c.bgColor == col256
+    check c.bgColorIdx == 100
+
+  test "39 resets fg to default":
+    let g = newGrid()
+    g.feed("\x1b[31mX\x1b[39mY")
+    check g.cellFg(0, 0) == colRed
+    check g.cellFg(0, 1) == colDefault
+
+  test "49 resets bg to default":
+    let g = newGrid()
+    g.feed("\x1b[44mX\x1b[49mY")
+    check g.cellBg(0, 0) == colBlue
+    check g.cellBg(0, 1) == colDefault
+
+  test "cellAt out of range returns default cell":
+    let g = newGrid()
+    let c = g.cellAt(99, 99)
+    check c.rune == Rune(' ')
+    check c.fgColor == colDefault
+    check c.bgColor == colDefault
+    check not c.attrs.hasAttr(saBold)
+
+  test "convenience procs cellAttr, cellFg, cellBg":
+    let g = newGrid()
+    g.feed("\x1b[1;36mX")
+    check g.cellAttr(0, 0).hasAttr(saBold)
+    check g.cellFg(0, 0) == colCyan
+    check g.cellBg(0, 0) == colDefault
 
 suite "grid: edge cases":
   test "rowText returns empty for out-of-range rows":

@@ -352,3 +352,92 @@ suite "grid: edge cases":
     check g.rowText(0) == "a"
     check g.rowText(1) == ""
     check g.rowText(2) == "b"
+
+suite "grid: terminal-like editing":
+  test "backspace moves cursor left and next write overwrites":
+    let g = newGrid()
+    g.feed("abc\bX")
+    check g.rowText(0) == "abX"
+    check g.col == 3
+
+  test "tab advances to the next tab stop with styled spaces":
+    let g = newGrid()
+    g.feed("\x1b[38;5;244mab\tX")
+    check g.rowText(0) == "ab      X"
+    check g.cellFg(0, 2) == col256
+    check g.cellAt(0, 2).fgColorIdx == 244
+    check g.cellFg(0, 7) == col256
+    check g.cellAt(0, 7).fgColorIdx == 244
+
+  test "custom tab width":
+    let g = newGrid()
+    g.tabWidth = 4
+    g.feed("ab\tX")
+    check g.rowText(0) == "ab  X"
+
+suite "grid: width and wrapping":
+  test "exactly filling a row leaves wrap pending until next printable":
+    let g = newGrid()
+    g.width = 5
+    g.feed("abcde")
+    check g.rowText(0) == "abcde"
+    check g.row == 0
+    check g.col == 5
+    check g.pendingWrap
+
+  test "plain text wraps when width is set":
+    let g = newGrid()
+    g.width = 5
+    g.feed("abcdef")
+    check g.rowText(0) == "abcde"
+    check g.rowText(1) == "f"
+    check g.row == 1
+    check g.col == 1
+
+  test "wide glyph consumes two cells and wraps before overflow":
+    let g = newGrid()
+    g.width = 4
+    g.feed("abc界Z")
+    check g.rowText(0) == "abc"
+    check g.rowText(1) == "界Z"
+    check g.cellAt(1, 0).width == 2
+    check g.cellAt(1, 1).width == 0
+    check g.col == 3
+
+  test "combining mark attaches to previous cell without advancing":
+    let g = newGrid()
+    g.feed("e\u0301X")
+    check g.rowText(0) == "e\u0301X"
+    check g.col == 2
+    check g.cellAt(0, 0).text == "e\u0301"
+    check g.cellAt(0, 1).text == "X"
+
+suite "grid: scrollback":
+  test "height limits visible rows and scrollback keeps history":
+    let g = newGrid()
+    g.height = 2
+    g.scrollback = 1
+    g.feed("a\nb\nc\nd")
+    check g.rows.len == 3
+    check g.rowText(0) == "b"
+    check g.rowText(1) == "c"
+    check g.rowText(2) == "d"
+    check g.row == 2
+
+suite "grid: malformed input is terminal-like":
+  test "malformed SGR params are ignored rather than raised":
+    let g = newGrid()
+    g.feed("\x1b[38;5;mX")
+    check g.rowText(0) == "X"
+    check g.cellFg(0, 0) == colDefault
+
+  test "out-of-range 256-color param is ignored":
+    let g = newGrid()
+    g.feed("\x1b[38;5;999mX")
+    check g.rowText(0) == "X"
+    check g.cellFg(0, 0) == colDefault
+
+  test "unknown private mode is ignored":
+    let g = newGrid()
+    g.feed("\x1b[?2026hX\x1b[?2026l")
+    check g.rowText(0) == "X"

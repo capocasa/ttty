@@ -2,9 +2,10 @@
 
 Headless terminal testing for Nim.
 
-`ttty` is a tiny in-memory ANSI/VT renderer. Feed it the bytes your terminal UI
-would write to stdout, then assert on the resulting screen grid: rows, cells,
-cursor position, cursor visibility, colors, and text attributes.
+`ttty` is a tiny in-memory terminal mock. Feed it the bytes your terminal UI
+would write to stdout, queue the bytes your user would type on stdin, then
+assert on the resulting screen grid: rows, cells, cursor position, cursor
+visibility, colors, text attributes, and pending input.
 
 It is built for tests that need more truth than `stripAnsi(output)`, but do not
 need a real PTY, a screenshot, or a full terminal emulator.
@@ -87,6 +88,18 @@ cellFg(g, row, col)
 cellBg(g, row, col)
 cellAttr(g, row, col)
 hasAttr(attrs, saBold)
+
+let input = newInput()
+input.pushText("hello")
+input.push(KeyEnter)
+input.read()
+input.hasPendingInput()
+
+let term = newTerminal(width = 80, height = 24)
+term.pushText("hello")
+term.write("> hello\r\n")
+term.read()
+rowText(term.grid, 0)
 ```
 
 `Grid` and `Cell` fields are public on purpose. For a test tool this small,
@@ -129,6 +142,55 @@ g.feed "abc\bZ"     # BS: move left, next write overwrites
 check rowText(g, 1) == "XabZ"
 
 g.feed "\tT"        # tab expands to spaces up to the next tab stop
+```
+
+## Input Queues
+
+`Input` models the byte stream a terminal application reads from stdin. This is
+deliberately byte-oriented because line editors usually need to see exact escape
+sequences:
+
+```nim
+let input = newInput()
+input.pushText("ab")
+input.push(KeyLeft)
+
+check input.read() == 'a'.int
+check input.read() == 'b'.int
+check input.hasPendingInput
+check input.read() == 27
+```
+
+Common key constants are exported:
+
+```nim
+input.push(KeyEnter)
+input.push(KeyEsc)
+input.push(KeyLeft)
+input.push(KeyKittyShiftEnter)
+input.push(KeyModifyOtherShiftEnter)
+```
+
+`read()` returns `-1` when the queue is empty. `hasPendingInput()` and
+`pendingLen()` let tests model timing-sensitive checks such as distinguishing a
+bare Escape from an ESC-prefixed key sequence.
+
+## Mock Terminal
+
+`Terminal` combines an input queue with an output grid. It is the usual choice
+for testing a REPL or line editor:
+
+```nim
+let term = newTerminal(width = 80, height = 24, scrollback = 200)
+term.pushText("hello")
+term.push(KeyEnter)
+
+let getCh = proc(): int = term.read()
+let write = proc(s: string) = term.write(s)
+let hasPendingInput = proc(): bool = term.hasPendingInput()
+
+discard myReadline(getCh, write, hasPendingInput)
+check rowText(term.grid, 0).startsWith("> hello")
 ```
 
 Supported CSI movement:
@@ -370,7 +432,7 @@ check hasAttr(g.cellAttr(g.row, 0), saBold)
 
 ## Limitations
 
-`ttty` is a focused test renderer, not a complete terminal emulator.
+`ttty` is a focused terminal mock, not a complete terminal emulator.
 
 Currently modeled:
 
@@ -385,6 +447,8 @@ Currently modeled:
 - SGR attributes, 16-color, 256-color, RGB marker
 - optional width, wrapping, terminal height, and scrollback
 - wide glyphs and combining marks
+- byte-oriented input queues
+- combined input/output mock terminals
 
 Not currently modeled:
 
@@ -392,6 +456,7 @@ Not currently modeled:
 - origin mode and margins beyond scroll regions
 - OSC sequences
 - mouse tracking
+- PTY process management
 - exact Unicode version and East Asian Ambiguous width policy
 - RGB component storage
 
@@ -404,7 +469,7 @@ are already modeled.
 
 The library is deliberately direct:
 
-- no PTY
+- no PTY process management
 - no subprocess
 - no terminal database
 - no screenshot comparison

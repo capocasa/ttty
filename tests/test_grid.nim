@@ -1,6 +1,6 @@
 import std/unittest
 import std/unicode
-import ttty/grid
+import ttty
 
 suite "grid: plain text":
   test "plain text renders on row 0":
@@ -534,3 +534,48 @@ suite "grid: bracketed paste mode":
     check g.bracketedPaste
     g.feed("\x1b[?2004l")
     check not g.bracketedPaste
+
+suite "input: queued bytes":
+  test "text and key sequences are read in order":
+    let input = newInput()
+    input.pushText("ab")
+    input.push(KeyLeft)
+    check input.pendingLen == 5
+    check input.read() == 'a'.int
+    check input.read() == 'b'.int
+    check input.hasPendingInput
+    check input.read() == 27
+    check input.read() == 91
+    check input.read() == 68
+    check input.read() == -1
+    check not input.hasPendingInput
+
+  test "clear removes queued and consumed input":
+    let input = newInput()
+    input.pushText("abc")
+    check input.read() == 'a'.int
+    input.clear()
+    check input.pendingLen == 0
+    check input.read() == -1
+
+suite "terminal: input and output":
+  test "terminal combines input queue with output grid":
+    let term = newTerminal(width = 10, height = 3, scrollback = 2)
+    term.pushText("hi")
+    term.push(KeyEnter)
+    term.write("> hi\r\n")
+    check term.read() == 'h'.int
+    check term.read() == 'i'.int
+    check term.read() == 13
+    check term.read() == -1
+    check rowText(term.grid, 0) == "> hi"
+    check term.output == "> hi\r\n"
+
+  test "terminal hasPendingInput tracks the input queue":
+    let term = newTerminal()
+    check not term.hasPendingInput
+    term.push(KeyModifyOtherShiftEnter)
+    check term.hasPendingInput
+    while term.read() >= 0:
+      discard
+    check not term.hasPendingInput

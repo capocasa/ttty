@@ -114,10 +114,42 @@ CORPUS: tests/corpus/*.raw harvested from ~/p/3code/linebugs tty test
 captures (120x40, DefaultTtyCols/Rows). welcome_minimal, provider_typing
 _a/_b/_c, provider_stream_turn, resume_bar.
 
-Next: Step 7 is a no-op so far (no ttty bugs found yet) — expand corpus if
-desired, or go straight to Step 8 (3code end-to-end via oracle driving the
-real stub across visual features incl. the prompt-only drift repro) then
-Step 9 (fix 3code drift, oracle red->green).
+STEP 8 DONE (committed 61eafa8): 3code prompt-only drift REPRODUCED on
+real xterm via oracle supervisor mode. tools/test_3code_drift.nim drives
+the real 3code stub (build/3code_stub, -d:ssl -d:providerStub --threads:on)
+inside the oracle, types `:provider stub` x4 via XTEST, reads xterm screen
+(media-copy) after each: last-content row climbs 16 -> 18 -> 19 -> 20 =
+prompt creeping DOWN ~1 row/command. This is the user's Bug 2, confirmed
+against ground truth (invisible in ttty).
+
+New oracle capabilities (src/ttty/x11oracle.nim):
+  - startOracle(..., run = "<cmd>", runEnv = [(k,v)]): supervisor mode.
+    helper (oracle_helper.nim) forks the cmd as a sub-child sharing the
+    tty; xterm renders the REAL program, XTEST keystrokes reach it.
+  - typeKeys(text, delayMs): XTEST keystroke injection. CRITICAL: must
+    focusWindow() first (XSetInputFocus RevertToParent) — bare Xvfb has no
+    WM so nothing is focused by default and keystrokes vanish silently.
+  - screenText() + cursor() work in run mode too (helper services cmd
+    files; it must NOT read stdin in supervisor mode — the program owns it).
+
+Known side observation: after the first :provider, subsequent typed input
+partially desyncs (a `:` shows as `;` on screen) — consistent with the
+walk-up model being off after the first commit, exactly the bug. Do NOT
+treat as a test artifact.
+
+STEP 7 (ttty bugs): none found — ttty conforms on all 6 corpus streams +
+10 synthetic sequences. ttty's model is correct; the drift is a 3code
+walk-up MATH bug (what it emits), not a ttty model bug.
+
+Next: Step 9 — fix the 3code prompt-only drift. The off-by-one: on a fresh
+prompt-only commit, 3code's walk-up under-counts by one row (likely the
+prompt-only CSI 2K-without-CSI-J path leaves the caret one row low, or the
+commit's erase doesn't reclaim the prompt row), so each commit parks the
+next prompt one row down. Fix in ~/p/3code (engine.nim appendTranscript
+prompt-only path / fatprompt commitTranscriptBytes), then re-run
+tools/test_3code_drift -> expect rows stable (no net drift). Rebuild stub
+after the fix (nim c -d:ssl -d:providerStub --threads:on --path:src
+-o:build/3code_stub src/threecode.nim). Then Step 10 verify + ttty release.
 
 ## Steps
 

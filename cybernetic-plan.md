@@ -167,8 +167,22 @@ Remaining work (folded in, not asking back):
 - Step 9 (was "fix 3code drift"): now conditional on 8b reproducing a real
   bug on xterm. If 8b reproduces, fix in ~/p/3code and re-verify oracle
   red->green. If not, the ttty grounding stands on its own.
-- Step 10: full verification (ttty suite + 3code tty suite + conformance),
-  release build, cut ttty release per ~/p/.agents/release.md.
+- Step 10 DONE: ttty 0.4.0 released. `nimble conformance` runs the corpus
+  suite (all 6 streams conform). test_grid 74 OK, test_3code_contract 0
+  FAIL, release build clean. nimble file gains x11 dep + oraclehelper /
+  conformance tasks; README gains a Ground Truth section. Tagged 0.4.0,
+  pushed main + tag to origin, `nimble install` resolves ttty-0.4.0.
+
+OUTCOME SUMMARY: the ttty grounding is complete and released. ttty conforms
+to real xterm on all captured streams. The originally-reported 3code bugs
+did NOT reproduce on xterm (the simple :provider sequence and the
+streaming-during-typing scenario both render cleanly), and the one "drift"
+seen earlier was a typeKeys Shift artifact, now fixed. The real bugs are
+most likely foot-specific or a timing race the clean scenarios don't hit.
+The oracle + terminaldbg probe are the instruments to catch them when they
+next surface. 3code's terminaldbg probe (src/threecode/terminaldbg.nim +
+probeDetail) remains uncommitted on the linebugs branch — decide whether to
+mainline it as a permanent opt-in diagnostic (Step 8c) before closing.
 
 ## Steps
 

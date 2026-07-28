@@ -63,6 +63,14 @@ type
     curFgIdx*: uint8
     curBgIdx*: uint8
     curAttrs*: SgrAttr
+    ## Stream well-formedness violations for paired private modes
+    ## (currently DEC 2026 synchronized output): nested begin, end without
+    ## begin, begin never closed. Interpretation is unchanged — terminals
+    ## that honor 2026 batch atomically, ttty applies sequentially — but
+    ## malformed frames are exactly where atomic and sequential semantics
+    ## diverge, so they are always worth flagging.
+    violations*: seq[string]
+    syncOpen: bool
 
 proc hasAttr*(attrs: SgrAttr, bit: int): bool {.inline.} =
   (uint16(attrs) and (1'u16 shl uint16(bit))) != 0
@@ -493,6 +501,17 @@ proc feed*(g: Grid, bytes: string) =
           elif params == "2004":
             if final == 'h': g.bracketedPaste = true
             elif final == 'l': g.bracketedPaste = false
+          elif params == "2026":
+            # DEC 2026 synchronized output. Semantics (batching) are not
+            # modeled — only frame well-formedness is validated.
+            if final == 'h':
+              if g.syncOpen:
+                g.violations.add "nested DEC 2026 sync begin at byte " & $i
+              g.syncOpen = true
+            elif final == 'l':
+              if not g.syncOpen:
+                g.violations.add "DEC 2026 sync end without begin at byte " & $i
+              g.syncOpen = false
         else:
           case final
           of '@':
@@ -559,6 +578,13 @@ proc feed*(g: Grid, bytes: string) =
       let r = runeAt(bytes, i)
       putRune(g, r)
       i += rl
+
+proc checkStreamClosed*(g: Grid) =
+  ## Call when a byte stream is complete: flags a DEC 2026 sync begin
+  ## that was never closed.
+  if g.syncOpen:
+    g.violations.add "DEC 2026 sync begin never closed"
+    g.syncOpen = false
 
 proc rowText*(g: Grid, r: int): string =
   if r < 0 or r >= g.rows.len: return ""

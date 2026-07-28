@@ -1,4 +1,4 @@
-import std/unittest
+import std/[unittest, strutils]
 import std/unicode
 import ttty
 
@@ -579,3 +579,40 @@ suite "terminal: input and output":
     while term.read() >= 0:
       discard
     check not term.hasPendingInput
+
+suite "grid: DEC 2026 sync frame validation":
+  test "well-formed frames produce no violations":
+    let g = newGrid()
+    g.feed("\x1b[?2026habc\x1b[?2026ldef\x1b[?2026hg\x1b[?2026l")
+    g.checkStreamClosed()
+    check g.violations.len == 0
+    check g.rowText(0) == "abcdefg"
+
+  test "nested begin is flagged":
+    let g = newGrid()
+    g.feed("\x1b[?2026ha\x1b[?2026hb\x1b[?2026l\x1b[?2026l")
+    g.checkStreamClosed()
+    check g.violations.len == 2
+    check "nested" in g.violations[0]
+    check "without begin" in g.violations[1]
+
+  test "end without begin is flagged":
+    let g = newGrid()
+    g.feed("abc\x1b[?2026l")
+    g.checkStreamClosed()
+    check g.violations.len == 1
+    check "without begin" in g.violations[0]
+
+  test "unclosed begin is flagged at stream end":
+    let g = newGrid()
+    g.feed("\x1b[?2026habc")
+    g.checkStreamClosed()
+    check g.violations.len == 1
+    check "never closed" in g.violations[0]
+
+  test "split across feeds stays balanced":
+    let g = newGrid()
+    g.feed("\x1b[?2026hab")
+    g.feed("c\x1b[?2026l")
+    g.checkStreamClosed()
+    check g.violations.len == 0

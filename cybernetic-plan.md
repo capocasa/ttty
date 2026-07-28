@@ -98,10 +98,26 @@ Committed: 90fea5c (oracle) + c091a45 (gitignore). Media-copy pivot NOT yet
 committed (conformance.nim rewritten for text; test_conformance tool needs
 rebuild + rerun; old pixel procs cellDiffCounts/inkRows/ink REMOVED).
 
-Next: Step 4 finish — rebuild helper+conformance, run tools/test_conformance
-against real xterm, expect ttty divergences on erase/walk-up cases, record
-them, then Step 7 (fix ttty). Also rewrite tools/test_oracle.nim (it used
-removed pixel procs) to the text API.
+STEPS 4-6 GREEN, committed (3ccc72d conformance+media-copy, 7e934cb corpus
+suite). tools/test_conformance: 10/10 sequences conform (plain, CR/LF, CR
+overwrite, cursor-up edit, EL, ED, walk-up erase, CUP, ICH, DCH).
+tests/test_x11_conformance.nim: all 6 real 3code corpus streams replayed
+through ttty AND fresh real xterm at 120x40 -> all conform. KEY LESSON:
+use a FRESH oracle per corpus stream (a shared xterm carries scroll state
+and produces false cursor divergences, e.g. leftover row-39 scroll).
+Existing test_grid suite still green. ttty had NO bugs on these streams —
+the model matches xterm. The 3code prompt-only drift bug is in 3code's
+walk-up MATH (what it emits), not in ttty's model, so ttty conformance
+passes while 3code still drifts on a real terminal. That is Step 9.
+
+CORPUS: tests/corpus/*.raw harvested from ~/p/3code/linebugs tty test
+captures (120x40, DefaultTtyCols/Rows). welcome_minimal, provider_typing
+_a/_b/_c, provider_stream_turn, resume_bar.
+
+Next: Step 7 is a no-op so far (no ttty bugs found yet) — expand corpus if
+desired, or go straight to Step 8 (3code end-to-end via oracle driving the
+real stub across visual features incl. the prompt-only drift repro) then
+Step 9 (fix 3code drift, oracle red->green).
 
 ## Steps
 

@@ -214,8 +214,16 @@ proc putRune(g: Grid, r: Rune) =
     return
   if g.pendingWrap:
     lineFeed(g)
-  if g.width > 0 and g.col > 0 and g.col + w > g.width:
+  # `col >= width` without pendingWrap means an erase cleared the wrap
+  # flag at the last column: the print lands at the last column and
+  # re-arms wrap (xterm). Only a mid-row overflow wraps eagerly.
+  if g.width > 0 and g.col > 0 and g.col + w > g.width and
+     g.col < g.width:
     lineFeed(g)
+  if g.width > 0 and g.col >= g.width:
+    # Erase-disarmed wrap at the last column: the print overwrites the
+    # last cell (xterm), then re-arms pending wrap below.
+    g.col = g.width - 1
   padTo(g.rows[g.row], g.col, g.curFg, g.curBg, g.curFgIdx, g.curBgIdx,
         g.curAttrs)
   let cell = Cell(rune: r, fgColor: g.curFg, bgColor: g.curBg,
@@ -259,8 +267,12 @@ proc eraseDisplay(g: Grid, mode: int) =
   ensureRow(g, g.row)
   case mode
   of 0:
-    if g.rows[g.row].len > g.col:
-      g.rows[g.row].setLen(g.col)
+    # Clear from cursor to end of row, then drop rows below. Content is
+    # blanked, not truncated: when the cursor is at/past the row's
+    # content (e.g. pending-wrap at the last column) the row's cells are
+    # preserved — xterm behaves this way (edge_wrap_ed.raw conformance).
+    for k in g.col ..< g.rows[g.row].len:
+      g.rows[g.row][k] = newCell()
     g.rows.setLen(g.row + 1)
   of 1:
     for r in 0 ..< g.row:
@@ -541,6 +553,10 @@ proc feed*(g: Grid, bytes: string) =
             if params.len > 0:
               mode = parseIntDefault(params, 0)
             eraseDisplay(g, mode)
+            # xterm clears pending-wrap on ED: text after `CSI J` at the
+            # last column overwrites the wrapped row's first cell rather
+            # than wrapping first (edge_wrap_ed.raw conformance).
+            g.pendingWrap = false
           of 'L':
             insertLines(g, parseN(params))
           of 'M':

@@ -118,9 +118,17 @@ proc findHelperBin(): string =
 
 # --- public API ---------------------------------------------------------------
 
-proc startOracle*(cols = 80, rows = 24; workDir = ""): Oracle =
+proc startOracle*(cols = 80, rows = 24; workDir = ""; run = "";
+                 runEnv: openArray[(string, string)] = []): Oracle =
   ## Launch Xvfb + xterm running the helper child. Blocks until the xterm
   ## window is mapped and cell geometry is known.
+  ##
+  ## `run`: when non-empty, the helper spawns this command as a real
+  ## interactive program on the tty (supervisor mode). Keystrokes injected
+  ## via XTEST reach it directly; the helper still answers cursor/screen
+  ## queries. Use this to drive a REAL program (e.g. 3code) inside the
+  ## oracle. When empty, the helper is in replay mode (feed bytes via
+  ## `feed`).
   result = Oracle(cols: cols, rows: rows)
   result.display = freeDisplay()
   result.dir = if workDir.len > 0: workDir
@@ -139,13 +147,18 @@ proc startOracle*(cols = 80, rows = 24; workDir = ""): Oracle =
   # (no SGR reconstruction escapes).
   let printCmd = "cat > " & (result.dir / "screen.txt")
   let geom = $cols & "x" & $rows
+  var xenv = @[("DISPLAY", result.display),
+               ("TTTY_ORACLE_DIR", result.dir)]
+  for (k, v) in runEnv:
+    xenv.add (k, v)
+  if run.len > 0:
+    xenv.add ("TTTY_ORACLE_RUN", run)
   result.xtermPid = spawnDetached(
     ["xterm", "-xrm", "xterm*allowWindowOps: true",
      "-xrm", "xterm*printerCommand: " & printCmd,
      "-xrm", "xterm*printAttributes: 0",
      "-geometry", geom, "-e", helperBin],
-    [("DISPLAY", result.display),
-     ("TTTY_ORACLE_DIR", result.dir)])
+    xenv)
 
   result.win = waitForWindow(result.dpy, "oracle_helper", 8000)
   if result.win == 0:
@@ -174,9 +187,45 @@ proc waitDone(o: Oracle; timeoutMs = 8000) =
 proc feed*(o: Oracle; bytes: string) =
   ## Render raw bytes through the real xterm (its child writes them to the
   ## tty). Synchronous: returns once xterm has been handed the bytes.
+  ## Replay mode only; in run mode the program owns the tty.
   writeFile(o.dir / "cmd_feed", bytes)
   o.waitDone()
   sleep 60  # let xterm actually paint before we capture
+
+proc keySymFor(ch: char): KeySym =
+  case ch
+  of '\n', '\r': XK_Return
+  of ' ': XK_space
+  of ':': XK_colon
+  of '.': XK_period
+  of '/': XK_slash
+  of '-': XK_minus
+  of '_': XK_underscore
+  else:
+    if ch in {'a'..'z'}: KeySym(ord(ch))
+    elif ch in {'A'..'Z'}: KeySym(ord(ch))
+    elif ch in {'0'..'9'}: KeySym(ord(ch))
+    else: XK_space
+
+proc focusWindow(o: Oracle) =
+  ## Give the xterm window keyboard focus. On a bare Xvfb with no window
+  ## manager nothing is focused by default, and XTEST key events go to the
+  ## focused window — so without this, injected keystrokes vanish.
+  discard XSetInputFocus(o.dpy, o.win, RevertToParent, CurrentTime)
+  discard XSync(o.dpy, 0.XBool)
+
+proc typeKeys*(o: Oracle; text: string; delayMs = 25) =
+  ## Inject real keystrokes into the xterm window via XTEST. In run mode
+  ## these reach the supervised program as genuine keyboard input. Focuses
+  ## the window first (see focusWindow).
+  o.focusWindow()
+  for ch in text:
+    let kc = XKeysymToKeycode(o.dpy, keySymFor(ch))
+    if kc == char(0): continue
+    discard XTestFakeKeyEvent(o.dpy, kc.cuint, 1.XBool, 0.culong)
+    discard XTestFakeKeyEvent(o.dpy, kc.cuint, 0.XBool, 0.culong)
+    discard XSync(o.dpy, 0.XBool)
+    sleep delayMs
 
 proc cursor*(o: Oracle): tuple[row, col: int] =
   ## xterm's real cursor position, 0-based, from its own DSR answer.

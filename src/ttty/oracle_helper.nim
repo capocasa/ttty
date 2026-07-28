@@ -1,16 +1,23 @@
-## Child helper for the x11 oracle. Runs INSIDE xterm as its `-e` command,
-## owns the tty, and is the only process that can query xterm in-band.
+## Child helper for the x11 oracle. Runs INSIDE xterm as its `-e` command
+## and owns the tty, so it is the only process that can query xterm in-band.
 ##
-## Driven by command files the oracle parent drops in TTTY_ORACLE_DIR:
+## Two modes:
+##
+## Replay mode (default): renders byte-streams the parent feeds it.
 ##   cmd_feed   raw bytes -> write verbatim to the tty (xterm renders them)
-##   cmd_query  empty     -> issue CSI 6 n, write xterm's answer to cursor.txt
-##   cmd_screen empty     -> issue CSI 0 i (print screen); xterm pipes its
-##                           rendered screen text to the printerCommand, which
-##                           writes screen.txt. Wait for it, then signal done.
-## After each action it writes `done` so the parent can synchronize.
 ##
-## Built once into build/oracle_helper by the test/oracle setup, NOT compiled
-## at oracle-start time (a shell-out to the compiler is unreliable headless).
+## Supervisor mode (TTTY_ORACLE_RUN set): spawn that command as a sub-child
+## sharing this tty, and forward input to it. Used to run a REAL interactive
+## program (e.g. the 3code stub) inside the oracle while still being able to
+## query xterm. Input typed via XTEST lands on this tty; the supervisor
+## passes it to the sub-child's stdin (which is the same tty), so it just
+## stays out of the way and only acts on command files.
+##
+## Common commands:
+##   cmd_query  -> issue CSI 6 n, write xterm's answer to cursor.txt
+##   cmd_screen -> issue CSI 0 i (print screen); xterm pipes its rendered
+##                 screen text to printerCommand (a `cat > screen.txt`).
+## After each action the helper writes `done` so the parent can synchronize.
 
 import std/[os, posix, termios, strutils]
 
@@ -23,6 +30,21 @@ proc main() =
   let doneF = dir / "done"
   let cursorF = dir / "cursor.txt"
   let screenF = dir / "screen.txt"
+
+  # Supervisor mode: spawn the real program as a sub-child on this tty.
+  let runCmd = getEnv("TTTY_ORACLE_RUN")
+  var childPid: Pid = 0
+  if runCmd.len > 0:
+    childPid = fork()
+    if childPid == 0:
+      # Replace this process image's child with the real program. It
+      # inherits our tty as stdin/stdout/stderr, so xterm renders it and
+      # XTEST keystrokes reach it directly.
+      var args = [cstring "/bin/sh", "-c", cstring(runCmd), nil]
+      discard execvp("/bin/sh", cast[cstringArray](args[0].addr))
+      quit(127)
+    # Parent (supervisor) falls through to the command loop, only servicing
+    # query/screen requests. It must NOT read stdin (that's the child's).
 
   proc query(): string =
     var orig: Termios
@@ -48,14 +70,13 @@ proc main() =
           if n > 0:
             total += n
             if total >= 4 and buf[total - 1] == 'R': break
-          else:
-            break
+            else: break
       result = buf[0 ..< total]
     finally:
       discard tcSetAttr(0, TCSANOW, addr orig)
 
   while true:
-    if fileExists(cmdFeed):
+    if fileExists(cmdFeed) and runCmd.len == 0:
       let bytes = readFile(cmdFeed)
       removeFile(cmdFeed)
       if bytes.len > 0:
@@ -68,10 +89,7 @@ proc main() =
     elif fileExists(cmdScreen):
       removeFile(cmdScreen)
       removeFile(screenF)
-      # Print screen (MC Ps=0): xterm pipes the rendered screen text to its
-      # printerCommand, which the oracle points at a `cat > screen.txt`.
       discard posix.write(1, cstring("\x1b[0i"), 4)
-      # Wait for the printer command to produce the file (async).
       var waited = 0
       while waited < 3000 and not fileExists(screenF):
         sleep(30)

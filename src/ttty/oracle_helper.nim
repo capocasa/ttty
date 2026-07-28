@@ -4,6 +4,9 @@
 ## Driven by command files the oracle parent drops in TTTY_ORACLE_DIR:
 ##   cmd_feed   raw bytes -> write verbatim to the tty (xterm renders them)
 ##   cmd_query  empty     -> issue CSI 6 n, write xterm's answer to cursor.txt
+##   cmd_screen empty     -> issue CSI 0 i (print screen); xterm pipes its
+##                           rendered screen text to the printerCommand, which
+##                           writes screen.txt. Wait for it, then signal done.
 ## After each action it writes `done` so the parent can synchronize.
 ##
 ## Built once into build/oracle_helper by the test/oracle setup, NOT compiled
@@ -16,8 +19,10 @@ proc main() =
   if dir.len == 0: quit("TTTY_ORACLE_DIR not set", 2)
   let cmdFeed = dir / "cmd_feed"
   let cmdQuery = dir / "cmd_query"
+  let cmdScreen = dir / "cmd_screen"
   let doneF = dir / "done"
   let cursorF = dir / "cursor.txt"
+  let screenF = dir / "screen.txt"
 
   proc query(): string =
     var orig: Termios
@@ -60,6 +65,18 @@ proc main() =
       removeFile(cmdQuery)
       writeFile(cursorF, query())
       writeFile(doneF, "query")
+    elif fileExists(cmdScreen):
+      removeFile(cmdScreen)
+      removeFile(screenF)
+      # Print screen (MC Ps=0): xterm pipes the rendered screen text to its
+      # printerCommand, which the oracle points at a `cat > screen.txt`.
+      discard posix.write(1, cstring("\x1b[0i"), 4)
+      # Wait for the printer command to produce the file (async).
+      var waited = 0
+      while waited < 3000 and not fileExists(screenF):
+        sleep(30)
+        waited += 30
+      writeFile(doneF, "screen")
     else:
       sleep(20)
 

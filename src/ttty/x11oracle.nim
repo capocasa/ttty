@@ -134,9 +134,15 @@ proc startOracle*(cols = 80, rows = 24; workDir = ""): Oracle =
   result.dpy = XOpenDisplay(result.display.cstring)
   doAssert result.dpy != nil, "cannot open display " & result.display
 
+  # The printer command turns xterm's Media Copy (CSI 0 i) into an exact
+  # text dump of the rendered screen. printAttributes:0 keeps it plain text
+  # (no SGR reconstruction escapes).
+  let printCmd = "cat > " & (result.dir / "screen.txt")
   let geom = $cols & "x" & $rows
   result.xtermPid = spawnDetached(
     ["xterm", "-xrm", "xterm*allowWindowOps: true",
+     "-xrm", "xterm*printerCommand: " & printCmd,
+     "-xrm", "xterm*printAttributes: 0",
      "-geometry", geom, "-e", helperBin],
     [("DISPLAY", result.display),
      ("TTTY_ORACLE_DIR", result.dir)])
@@ -188,37 +194,27 @@ proc cursor*(o: Oracle): tuple[row, col: int] =
       return (max(0, r - 1), max(0, c - 1))
   (0, 0)
 
-proc inkRows*(o: Oracle): seq[seq[bool]] =
-  ## Per-cell ink map: true where xterm painted a non-background pixel.
-  ## Background is assumed to be pixel value 0 (xterm default black).
-  var att: XWindowAttributes
-  discard XGetWindowAttributes(o.dpy, o.win, addr att)
-  let img = XGetImage(o.dpy, o.win, 0, 0, att.width.cuint, att.height.cuint,
-                      AllPlanes, ZPixmap)
-  doAssert img != nil, "XGetImage failed"
-  defer: discard XDestroyImage(img)
-  # Calibrate the background from the top-left pixel (xterm paints its
-  # default background there). Ink = any sampled pixel that differs from it.
-  let bg = XGetPixel(img, 0, 0)
-  result = newSeq[seq[bool]](o.rows)
+proc screenText*(o: Oracle): seq[string] =
+  ## xterm's exact rendered screen as text rows, via Media Copy (CSI 0 i):
+  ## xterm pipes the visible screen to its printerCommand, which we point at
+  ## a file. This is the ground truth — what xterm actually displays — with
+  ## no pixel decoding. Rows are right-trimmed of trailing blanks; the
+  ## sequence has exactly `rows` entries (blank rows as "").
+  writeFile(o.dir / "cmd_screen", "")
+  o.waitDone()
+  let raw = readFile(o.dir / "screen.txt")
+  var lines = raw.split('\n')
+  # Drop a single trailing empty line from the file's final newline.
+  if lines.len > 0 and lines[^1].len == 0:
+    lines.setLen(lines.len - 1)
+  # xterm pads each printed row to the full width with spaces and emits
+  # `rows` lines; normalize: right-trim, then pad/truncate to `rows`.
+  result = newSeq[string](o.rows)
   for r in 0 ..< o.rows:
-    result[r] = newSeq[bool](o.cols)
-    for c in 0 ..< o.cols:
-      let x0 = c * o.cellW
-      let y0 = r * o.cellH
-      # Count pixels that differ from the calibrated background. A glyph
-      # covers a meaningful fraction of the cell; the block cursor is a
-      # single full cell (excluded by callers or treated as ink at the
-      # cursor position). Require a few differing pixels to reject noise.
-      var diff = 0
-      for dy in 1 ..< o.cellH - 1:
-        for dx in 0 ..< o.cellW:
-          if XGetPixel(img, (x0 + dx).cint, (y0 + dy).cint) != bg:
-            inc diff
-      result[r][c] = diff >= 3
-
-proc ink*(o: Oracle; r, c: int): bool =
-  o.inkRows()[r][c]
+    if r < lines.len:
+      result[r] = lines[r].strip(leading = false, trailing = true)
+    else:
+      result[r] = ""
 
 proc stop*(o: Oracle) =
   if not o.started: return

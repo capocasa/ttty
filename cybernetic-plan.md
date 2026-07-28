@@ -65,20 +65,43 @@ spinners, CR/LF) 3code emits. We replay them.
 
 ## Current state
 
-Step 1 spike GREEN (tools/spike_oracle.nim). Proven from one Nim process,
-fully headless: posix fork/exec (NOT execCmdEx — it hangs in this shell
-environment, use fork/setsid/execvp + putEnv) launches Xvfb :93 and xterm
-(80x24). XQueryTree finds the xterm window (title is the child cmd name,
-e.g. "bash"); XGetWindowAttributes 484x316 px = 80x24 cells at exactly 6x13
-px/cell; XGetImage reads real pixels (non-black count confirms content).
-Comms channel decision: parent<->child is fork/exec + child writes reply
-FILES (geom/cursor); xterm in-band queries (CSI 6 n cursor, 14t/18t size)
-work when the child owns the tty and reads its own stdin in raw mode (a Nim
-helper, mirroring 3code's terminaldbg probe — bash /dev/tty read is flaky).
-Keystroke injection: XTEST XTestFakeKeyEvent with XKeysymToKeycode.
+PIVOT (important): the ground-truth channel is xterm's MEDIA COPY text
+dump, NOT XGetImage pixels. Pixel decoding was a fragile detour (block
+cursor leaves ghost ink cells on move / artifacts on reveal; anti-alias
+noise). Correct channel, verified working:
+  - SCREEN TEXT: helper issues `CSI 0 i` (Media Copy, print screen). xterm
+    is launched with `-xrm 'xterm*printerCommand: cat > <dir>/screen.txt'`
+    and `-xrm 'xterm*printAttributes: 0'`. xterm pipes its EXACT rendered
+    screen as plain text (rows space-padded, right-trim on read). This is
+    the self-concealment-proof ground truth. NOTE: `CSI ? 15 i` is printer
+    STATUS, not print — print is `CSI 0 i`. Media Copy only works in
+    xterm/mlterm, fine since we drive real xterm.
+  - CURSOR: helper issues `CSI 6 n`, reads xterm's `ESC[r;cR` on its own
+    stdin in raw mode (mirrors 3code terminaldbg probe). Exact.
+Ghostty's own xterm audit (issue #632) is behavioral unit tests with
+hand-verified expected state, NOT a live oracle — our live-oracle compare
+is stronger. ttty models the same state ghostty asserts, so this maps 1:1.
 
-Next: Step 2 — package into src/ttty/x11oracle.nim with a clean API and a
-Nim child helper (not bash) that answers cursor/geometry queries from stdin.
+DONE + working (compiled clean, run green):
+  - src/ttty/x11oracle.nim: startOracle/feed/cursor/screenText/stop +
+    oracleAvailable. Cursor + screenText verified: feed "hello world\\r\\n
+    second line\\r\\n" -> row0='hello world' row1='second line' row2='',
+    cursor=(2,0). helper = prebuilt build/oracle_helper (fork/exec; child
+    owns tty; cmd files cmd_feed/cmd_query/cmd_screen; `done` sync file).
+  - src/ttty/conformance.nim: compareToOracle(bytes) asserts ttty Grid ==
+    oracle on cursor AND per-row screen text (rowText vs screenText).
+Process notes: execCmdEx/execShellCmd HANG in this shell — always posix
+fork/exec (spawnDetached in x11oracle). Build helper via direct
+`nim c -o:build/oracle_helper src/ttty/oracle_helper.nim`. Test binaries
+go in build/ (gitignored). x11 nimble pkg path via `nimble path x11`.
+Committed: 90fea5c (oracle) + c091a45 (gitignore). Media-copy pivot NOT yet
+committed (conformance.nim rewritten for text; test_conformance tool needs
+rebuild + rerun; old pixel procs cellDiffCounts/inkRows/ink REMOVED).
+
+Next: Step 4 finish — rebuild helper+conformance, run tools/test_conformance
+against real xterm, expect ttty divergences on erase/walk-up cases, record
+them, then Step 7 (fix ttty). Also rewrite tools/test_oracle.nim (it used
+removed pixel procs) to the text API.
 
 ## Steps
 
@@ -86,16 +109,24 @@ Nim child helper (not bash) that answers cursor/geometry queries from stdin.
       XGetImage pixel readback at 6x13 px/cell. Channel = fork/exec + child
   writes reply files; xterm queries via a Nim child helper on its own stdin.
   execCmdEx hangs here — always posix fork/exec. See Current state.
-- [ ] 2. `src/ttty/x11oracle.nim`: package the spike into a clean Nim API
-      (start/stop, feed, cursor, geometry, inkCells, typeKeys). Manage Xvfb
-  lifecycle (pick free display, kill on close). No test wiring yet.
-- [ ] 3. Screen reader: decode `XGetImage` pixels -> per-cell ink bitmap using
-      queried cell geometry; expose `inkAt(r,c)` and `inkRows()`. Add glyph
-  -> text decoding ONLY if cheap via a fixed-font atlas; otherwise assert
-  ink/cursor and keep text assertions in ttty. Decide in-code.
-- [ ] 4. `src/ttty/conformance.nim`: comparator that feeds one byte stream to
-      ttty Grid + oracle and asserts agreement (cursor + ink + text where
-  available). Clear divergence reporting (row, expected vs actual).
+- [x] 2. `src/ttty/x11oracle.nim` DONE: startOracle(cols,rows)/feed/cursor/
+      inkRows/stop + oracleAvailable. Child helper is a prebuilt binary
+  (src/ttty/oracle_helper.nim -> build/oracle_helper), fork/exec Xvfb+xterm,
+  window found via XQueryTree title "oracle_helper". Cursor via helper
+  reading its own stdin DSR (exact, matches model). Committed 90fea5c.
+- [x] 3. Screen reader DONE: XGetImage / 6x13 cell -> per-cell ink map.
+      Background calibrated from pixel (0,0); a cell has ink when >=3 sampled
+  pixels differ from bg. Block cursor counts as ink at its cell (correct —
+  cursor query reports it; hide cursor via DECTCEM when only glyph ink is
+  wanted). tools/test_oracle.nim GREEN: 'hello'->cursor(0,5), ink cols0-4;
+  '\\r\\nworld'->cursor(1,5). No glyph->text decode (per user: ignore fonts/
+  pixels-as-appearance; text stays in ttty). Committed 90fea5c.
+- [ ] 4. `src/ttty/conformance.nim`: comparator feeding one byte stream to
+      ttty Grid + oracle, asserting cursor + ink agreement. Key mapping:
+  ttty cell (r,c) has text iff oracle ink(r,c), EXCLUDING the cursor cell
+  (oracle paints block cursor there; hide it via DECTCEM prefix during
+  replay so ink == text exactly). Compare row text too. Report first
+  divergence with full context.
 - [ ] 5. Harvest corpus: collect real `.raw` streams from ~/p/3code tty tests
       into `tests/corpus/` with a small manifest (name + source scenario).
   Include the prompt-only `:provider` sequence (the drift repro).

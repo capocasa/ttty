@@ -1,0 +1,37 @@
+
+  ╭─╮
+   ─┤  3code v0.6.0-linebugs-d21ef8f2-unstaged   the economical coding agent
+  ╰─╯
+
+  provider  stub
+  model     stub-model
+  reasoning low
+
+  type a prompt. :help for commands. :q or Ctrl-D to exit.
+
+● resumed 20260728T193235
+❯ hello
+
+● the quick brown fox jumps
+
+
+  ○0%  ↑40  ↓6
+❯ 
+  ○0%  ↑40  ↓6
+❯ 
+  ○0%  ↑40  ↓6
+❯ t
+  ○0%  ↑40  ↓6
+❯ ty
+  ○0%  ↑40  ↓6
+❯ typ
+  ○0%  ↑40  ↓6
+❯ 
+  ○0%  ↑40  ↓6
+❯ 
+  ○0%  ↑40  ↓6
+❯ :
+  ○0%  ↑40  ↓6
+❯ :q
+  ○0%  ↑40  ↓6
+❯ :q

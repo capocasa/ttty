@@ -430,6 +430,39 @@ check g.cellFg(g.row, 0) == colCyan
 check hasAttr(g.cellAttr(g.row, 0), saBold)
 ```
 
+## Ground Truth: The xterm Oracle
+
+`ttty`'s grid is a model — and a model shares the assumptions of the code
+that emits the bytes. That is a blind spot: if an application computes a
+cursor walk-up that disagrees with the physical terminal, feeding the same
+bytes to `ttty` reproduces the same wrong assumption, so the divergence is
+invisible in the grid. Bugs of that class (a walk-up that erases one row of
+scrollback, a prompt that drifts) cannot be caught by any in-memory model.
+
+`src/ttty/x11oracle.nim` closes that gap by running a REAL `xterm` on a
+headless Xvfb display and reading back what xterm actually did:
+
+- `cursor(o)` — xterm's real cursor position, from its own `CSI 6 n` answer
+- `screenText(o)` — xterm's exact rendered screen, via Media Copy (`CSI 0 i`)
+- `feed(o, bytes)` — render bytes through real xterm (replay mode)
+- `typeKeys(o, text)` — inject genuine keystrokes via XTEST (supervisor
+  mode, for driving a real interactive program inside the oracle)
+
+`src/ttty/conformance.nim` compares a `Grid` against the oracle on cursor +
+screen text, so a test can assert that ttty's model matches ground truth for
+any byte stream. `tests/test_x11_conformance.nim` replays real captured
+application streams and asserts agreement.
+
+Requires `Xvfb` + `xterm` + the `x11` Nim package. Build the child helper
+and run conformance with:
+
+```sh
+nimble conformance
+```
+
+The core grid has no X dependency; the oracle is opt-in and self-skips when
+Xvfb/xterm are absent.
+
 ## Limitations
 
 `ttty` is a focused terminal mock, not a complete terminal emulator.

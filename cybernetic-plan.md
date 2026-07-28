@@ -114,13 +114,18 @@ CORPUS: tests/corpus/*.raw harvested from ~/p/3code/linebugs tty test
 captures (120x40, DefaultTtyCols/Rows). welcome_minimal, provider_typing
 _a/_b/_c, provider_stream_turn, resume_bar.
 
-STEP 8 DONE (committed 61eafa8): 3code prompt-only drift REPRODUCED on
-real xterm via oracle supervisor mode. tools/test_3code_drift.nim drives
-the real 3code stub (build/3code_stub, -d:ssl -d:providerStub --threads:on)
-inside the oracle, types `:provider stub` x4 via XTEST, reads xterm screen
-(media-copy) after each: last-content row climbs 16 -> 18 -> 19 -> 20 =
-prompt creeping DOWN ~1 row/command. This is the user's Bug 2, confirmed
-against ground truth (invisible in ttty).
+STEP 8 REVISED (committed ac9b60c): the earlier "drift reproduction" was a
+TEST ARTIFACT, not the bug. Root cause of the artifact: typeKeys did not
+hold Shift for shifted chars, so `:provider` was typed as `;provider`
+(unknown command -> error path -> messy screen that looked like drift).
+With typeKeys fixed to hold Shift, repeated `:provider stub` x3 renders
+PERFECTLY on real xterm: each echo + 3-line profile + proper blank-line
+separation + clean prompt, no eaten lines, no overlap, no anomalous drift.
+So CURRENT 3code is CORRECT for this sequence on xterm. The user's bug is
+real but environmental/timing-dependent (it was originally seen in foot,
+and spuriously). IMPORTANT LESSON: verify the injected input actually
+landed (dump the screen) before concluding an app bug — a corrupted input
+stream masquerades as the very walk-up corruption being tested.
 
 New oracle capabilities (src/ttty/x11oracle.nim):
   - startOracle(..., run = "<cmd>", runEnv = [(k,v)]): supervisor mode.
@@ -138,18 +143,32 @@ walk-up model being off after the first commit, exactly the bug. Do NOT
 treat as a test artifact.
 
 STEP 7 (ttty bugs): none found — ttty conforms on all 6 corpus streams +
-10 synthetic sequences. ttty's model is correct; the drift is a 3code
-walk-up MATH bug (what it emits), not a ttty model bug.
+10 synthetic sequences. ttty's model is correct.
 
-Next: Step 9 — fix the 3code prompt-only drift. The off-by-one: on a fresh
-prompt-only commit, 3code's walk-up under-counts by one row (likely the
-prompt-only CSI 2K-without-CSI-J path leaves the caret one row low, or the
-commit's erase doesn't reclaim the prompt row), so each commit parks the
-next prompt one row down. Fix in ~/p/3code (engine.nim appendTranscript
-prompt-only path / fatprompt commitTranscriptBytes), then re-run
-tools/test_3code_drift -> expect rows stable (no net drift). Rebuild stub
-after the fix (nim c -d:ssl -d:providerStub --threads:on --path:src
--o:build/3code_stub src/threecode.nim). Then Step 10 verify + ttty release.
+REASSESSMENT (ac9b60c): 3code is NOT visibly buggy for the simple
+:provider sequence on xterm. The original bugs (status line hidden before
+first prompt; line above prompt erased; prompt jump on submit) were seen
+on foot and spuriously. They are likely TIMING (spinner/streaming races)
+or TERMINAL-specific (foot vs xterm rendering), which the clean
+:provider-only path does not exercise.
+
+Remaining work (folded in, not asking back):
+- Step 8b: reproduce the ACTUAL reported bugs, not the simplified one:
+  (a) streaming turn with a reasoning spinner active while typing (the
+  `test_slurp_resize_reasoning` / `test_typing_during_stream` scenarios)
+  driven through the oracle, asserting no scrollback line is eaten;
+  (b) submit transition (prompt echo -> spinner) watched for the one-row
+  prompt jump; (c) if reproducible on xterm, fix; if only on foot, note
+  that the oracle is xterm-specific and consider a foot oracle later.
+- Step 8c: make the terminaldbg probe (3code, src/threecode/terminaldbg.nim
+  + probeDetail in engine.nim) a permanent opt-in diagnostic rather than a
+  throwaway — it is what pinpoints stale walk-up components (ft/ed/lv) on
+  a real terminal. Decide whether to keep it in 3code mainline.
+- Step 9 (was "fix 3code drift"): now conditional on 8b reproducing a real
+  bug on xterm. If 8b reproduces, fix in ~/p/3code and re-verify oracle
+  red->green. If not, the ttty grounding stands on its own.
+- Step 10: full verification (ttty suite + 3code tty suite + conformance),
+  release build, cut ttty release per ~/p/.agents/release.md.
 
 ## Steps
 

@@ -214,16 +214,30 @@ proc focusWindow(o: Oracle) =
   discard XSetInputFocus(o.dpy, o.win, RevertToParent, CurrentTime)
   discard XSync(o.dpy, 0.XBool)
 
+proc needsShift(ch: char): bool =
+  ## Characters produced by holding Shift on a US layout. `XKeysymToKeycode`
+  ## maps the shifted keysym to the base key, so we must hold Shift
+  ## ourselves or xterm receives the unshifted char (`:` arrives as `;`).
+  ch in {'A'..'Z'} or ch in {'!', '@', '#', '$', '%', '^', '&', '*', '(',
+    ')', '_', '+', '{', '}', '|', ':', '"', '<', '>', '?', '~'}
+
 proc typeKeys*(o: Oracle; text: string; delayMs = 25) =
   ## Inject real keystrokes into the xterm window via XTEST. In run mode
   ## these reach the supervised program as genuine keyboard input. Focuses
-  ## the window first (see focusWindow).
+  ## the window first (see focusWindow). Holds Shift for shifted characters
+  ## (see needsShift).
   o.focusWindow()
+  let shiftKc = XKeysymToKeycode(o.dpy, XK_Shift_L)
   for ch in text:
     let kc = XKeysymToKeycode(o.dpy, keySymFor(ch))
     if kc == char(0): continue
+    let shifted = needsShift(ch)
+    if shifted:
+      discard XTestFakeKeyEvent(o.dpy, shiftKc.cuint, 1.XBool, 0.culong)
     discard XTestFakeKeyEvent(o.dpy, kc.cuint, 1.XBool, 0.culong)
     discard XTestFakeKeyEvent(o.dpy, kc.cuint, 0.XBool, 0.culong)
+    if shifted:
+      discard XTestFakeKeyEvent(o.dpy, shiftKc.cuint, 0.XBool, 0.culong)
     discard XSync(o.dpy, 0.XBool)
     sleep delayMs
 

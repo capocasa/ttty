@@ -6,3 +6,6 @@
 # OS junk
 .DS_Store
 Thumbs.db
+tools/spike_oracle
+test_cdsens
+tests/test_grid

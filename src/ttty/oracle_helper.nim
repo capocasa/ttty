@@ -75,6 +75,11 @@ proc main() =
     finally:
       discard tcSetAttr(0, TCSANOW, addr orig)
 
+  # Tell the parent the command loop is running and the helper owns the tty.
+  # The oracle waits for this before feeding or querying: the terminal maps
+  # its window before the helper is up, and an early feed/query lands in a
+  # terminal that is not reading yet.
+  writeFile(dir / "ready", "")
   while true:
     if fileExists(cmdFeed) and runCmd.len == 0:
       let bytes = readFile(cmdFeed)

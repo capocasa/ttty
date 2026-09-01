@@ -52,14 +52,29 @@ proc compareToOracle*(bytes: string; cols = 80, rows = 24;
       detail: "ttty cursor=(" & $g.row & "," & $g.col & ") but xterm=(" &
         $oc.row & "," & $oc.col & ")"))
 
-  # Screen text agreement over the visible rows.
+  # Screen agreement over the visible rows. xterm gives exact text (Media
+  # Copy), so compare text cell-for-cell. st gives an ink map (occupancy),
+  # so compare per-cell painted/blank against the grid's non-blank cells —
+  # this still catches a row erased when it should have stayed (the
+  # scrollback-desync class this oracle exists to expose), without OCR.
   let xt = o.screenText()
   for r in 0 ..< rows:
     let tt = rowText(g, r).strip(leading = false, trailing = true)
     let xr = if r < xt.len: xt[r] else: ""
-    if tt != xr:
-      return (false, Divergence(kind: "row", row: r,
-        detail: "row " & $r & ": ttty=" & tt.escape & " xterm=" & xr.escape))
+    if o.term == termXterm:
+      if tt != xr:
+        return (false, Divergence(kind: "row", row: r,
+          detail: "row " & $r & ": ttty=" & tt.escape & " xterm=" & xr.escape))
+    else:
+      # ink map row: '#' per painted cell, space per blank. Compare the
+      # occupancy pattern against the grid's non-blank span.
+      let gridInk = tt.len > 0
+      let termInk = xr.len > 0
+      if gridInk != termInk:
+        return (false, Divergence(kind: "row", row: r,
+          detail: "row " & $r & " occupancy: ttty " & (if gridInk: "painted" else: "blank") &
+            " but terminal " & (if termInk: "painted" else: "blank") &
+            " (ttty text=" & tt.escape & ")"))
 
   result = (true, Divergence())
 

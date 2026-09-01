@@ -1,224 +1,170 @@
-# ttty ground-truth grounding via real xterm
+# Cybernetic Plan — Make ttty byte-faithful to xterm
 
 ## Context
 
-ttty is a ~580-line in-memory ANSI VT grid (`src/ttty/grid.nim`) used as the
-screen model for 3code's PTY test harness (`tests/tty_expect.nim` in
-~/p/3code). It has a structural blind spot the user hit as two real bugs:
-ttty interprets bytes with the *same row/cursor model* the app uses to emit
-them, so a model-vs-physical desync (walk-up off by one, wrap disagreement)
-is invisible in ttty's captured frames — the erase lands in scrollback and
-ttty applies the identical wrong assumption, so frames look perfect.
+3code has a terminal-rendering bug that only appears on a real xterm, never
+in the ttty PTY harness: on submit, the `type a prompt.` welcome hint line
+(and the echoed `❯ …` line) get erased by a walk-up that over-shoots into
+scrollback. Root cause is a **model-vs-physical desync** that the ttty harness
+structurally cannot see, for three stacked reasons. This plan fixes all three
+in ttty so the harness can actually catch this class of bug.
 
-Observed in a real xterm: 3code's prompt-only commit path under-walks by one
-row, so the prompt drifts down one row per `:provider` command (confirmed via
-a DSR `CSI 6 n` probe: absolute cursor row climbed 12 → 17 → 23 across three
-identical commands, +1 unaccounted each time). ttty showed no such drift.
+Why ttty misses it today:
 
-Goal: ground ttty against a REAL terminal (xterm on Xvfb, driven via the
-`x11` Nim package) so ttty's grid is validated against ground truth across
-many sequences. We compare TEXT + CURSOR + INK/BLANK structure only —
-we explicitly do NOT decode fonts, colors, or SGR appearance from pixels
-(SGR attr values stay ttty-internal assertions). Conformance inputs are REAL
-byte streams captured from 3code's tty tests (`s.raw` in tty_expect.nim),
-replayed through both ttty and the xterm oracle, asserting agreement.
+1. **Oracle can't run under the sandbox.** `src/ttty/x11oracle.nim`
+   `startOracle` launches `xterm -e helperBin` (line ~162). `xterm -e` makes
+   xterm allocate its **own** pty, which the sandbox blocks
+   (`open ttydev: Permission denied`). Confirmed: `xterm -e` fails here, while
+   `xterm -S<fd>` with an **externally-allocated** pty (openpty in the parent,
+   pass slave fd) works. So the whole conformance suite
+   (`tests/test_x11_conformance.nim`) is inert on any machine with this
+   restriction — it crashes at `startOracle` instead of testing.
 
-Verified ground-truth channels (proven working this session):
-- xterm answers `CSI 6 n` → `ESC[<row>;<col>R` (cursor, 1-based)
-- xterm answers `CSI 18 t` → `ESC[8;<rows>;<cols>t` (screen size in cells)
-- xterm answers `CSI 14 t` → `ESC[4;<h>;<w>t` (text area in pixels); needs
-  `-xrm 'xterm*allowWindowOps: true'`. Confirmed 80x24 → 480x312 px → cell = 6x13 px.
-- The child running INSIDE xterm (as `xterm -e <child>`) owns the tty and can
-  issue these queries itself, reading replies on its stdin in raw mode.
-- Keystrokes injectable from outside via XTEST (`xdotool` or x11 pkg
-  `XTestFakeKeyEvent`); pixels readable via `XGetImage`.
-- Xvfb: `Xvfb :99 -screen 0 1024x768x24`. Headless, CI-friendly.
+2. **Corpus is ONLCR-blind.** Every `tests/corpus/*.raw` has **lone `\n` only,
+   zero `\r\n`**. But 3code emits `\r\n`, and a real xterm pty (OPOST+ONLCR on)
+   delivers `\r\r\n` on the master (each explicit `\r\n` → `\r\r\n`). The corpus
+   was captured through a cooked path that stripped `\r`, so the oracle has
+   never been fed xterm-realistic bytes. Feeding pre-cooked bytes to both ttty
+   and xterm only confirms they agree on cooked bytes — it can't surface a
+   raw/cooked desync, which is exactly this bug's class.
 
-The x11 Nim package (~/.nimble/pkgs2/x11-1.2-...) exports: XOpenDisplay,
-XDefaultRootWindow, XQueryTree, XGetWindowAttributes, XGetImage, XGetPixel,
-XTestFakeKeyEvent, XStringToKeysym, XKeysymToKeycode, XWarpPointer, XSync/XFlush.
+3. **ttty grid and xterm interpret the same cooked model.** `Grid.feed` treats
+   `\r`=col0, `\n`=linefeed — identical to xterm. When input bytes already match
+   the app's geometry model, both renderers produce the same (wrong-on-real-
+   hardware) picture. The desync appears only when the **pty line discipline**
+   transforms bytes between the app and renderer. ttty sits *after* that
+   transform, so it never models it. There is no ONLCR/cooked-output layer.
 
-Corpus source: ~/p/3code tests write `frames.txt.raw` per tty test
-(probe_linebugs, probe_resume_bar, slurp_resize, spinner_race, etc.). These
-are the real sequences (walk-ups `CSI n A`, erases `CSI J/K`, footers,
-spinners, CR/LF) 3code emits. We replay them.
+Goal: ttty must be able to (a) run the xterm oracle under the sandbox, (b)
+replay a faithfully-captured raw stream that includes ONLCR effects, and (c)
+optionally model the cooked-mode transform itself so it can predict xterm's
+physical result from app-side bytes.
 
-## Architecture (decided)
-
-- `src/ttty/x11oracle.nim` — spawn Xvfb + xterm running a child shim; the
-  shim owns the tty and can query xterm in-band. Oracle ops:
-    feed(bytes)   -> shim writes bytes to its own tty (xterm renders)
-    cursor()      -> CSI 6 n -> (row, col) 1-based
-    geometry()    -> CSI 18 t / 14 t -> cells + pixel cell size
-    inkCells()    -> XGetImage / cell size -> per-cell ink bitmap
-    typeKeys(s)   -> XTEST keystrokes (only where real input needed)
-  Communication parent<->shim: simplest robust channel (shim reads a command
-  FIFO/file, writes replies to a result FIFO/file, OR shim speaks a tiny
-  line protocol on a socket). Chosen below after first spike.
-- `src/ttty/conformance.nim` — replay a corpus stream into both a ttty Grid
-  and the oracle; assert text-per-row (where decodable), cursor row/col,
-  ink/blank map. Report first divergence with full context.
-- Byte-replay for the corpus (fast, deterministic). A thin XTEST
-  keystroke-driven end-to-end layer for real 3code binary later.
-- Most 3code tests stay in ttty for speed; the xterm rig is the oracle for
-  conformance + a few integration tests.
+Key locations:
+- `src/ttty/x11oracle.nim` — `startOracle` (xterm spawn), `spawnDetached`,
+  `feed`, `cursor`, `screenText`, `stop`.
+- `src/ttty/oracle_helper.nim` — child that owns the tty; replay/supervisor
+  modes; answers DSR + Media Copy queries. Runs as xterm's `-e` command today.
+- `src/ttty/grid.nim` — `feed` (byte loop ~line 478), `lineFeed`, `\r`/`\n`
+  cases. Where the ONLCR model goes.
+- `src/ttty/conformance.nim` — `compareToOracle`.
+- `tests/test_x11_conformance.nim` — corpus replay suite.
+- `tests/corpus/*.raw` — captured streams (currently ONLCR-blind).
 
 ## Current state
 
-PIVOT (important): the ground-truth channel is xterm's MEDIA COPY text
-dump, NOT XGetImage pixels. Pixel decoding was a fragile detour (block
-cursor leaves ghost ink cells on move / artifacts on reveal; anti-alias
-noise). Correct channel, verified working:
-  - SCREEN TEXT: helper issues `CSI 0 i` (Media Copy, print screen). xterm
-    is launched with `-xrm 'xterm*printerCommand: cat > <dir>/screen.txt'`
-    and `-xrm 'xterm*printAttributes: 0'`. xterm pipes its EXACT rendered
-    screen as plain text (rows space-padded, right-trim on read). This is
-    the self-concealment-proof ground truth. NOTE: `CSI ? 15 i` is printer
-    STATUS, not print — print is `CSI 0 i`. Media Copy only works in
-    xterm/mlterm, fine since we drive real xterm.
-  - CURSOR: helper issues `CSI 6 n`, reads xterm's `ESC[r;cR` on its own
-    stdin in raw mode (mirrors 3code terminaldbg probe). Exact.
-Ghostty's own xterm audit (issue #632) is behavioral unit tests with
-hand-verified expected state, NOT a live oracle — our live-oracle compare
-is stronger. ttty models the same state ghostty asserts, so this maps 1:1.
+Step 1 BLOCKED on a hard xterm architectural constraint, partially implemented.
+The `-S` rework is written into `x11oracle.nim` (compiles; window maps; helper
+spawns) but DSR + Media Copy return nothing, so `cursor()`/`screenText()` get
+no ground truth.
 
-DONE + working (compiled clean, run green):
-  - src/ttty/x11oracle.nim: startOracle/feed/cursor/screenText/stop +
-    oracleAvailable. Cursor + screenText verified: feed "hello world\\r\\n
-    second line\\r\\n" -> row0='hello world' row1='second line' row2='',
-    cursor=(2,0). helper = prebuilt build/oracle_helper (fork/exec; child
-    owns tty; cmd files cmd_feed/cmd_query/cmd_screen; `done` sync file).
-  - src/ttty/conformance.nim: compareToOracle(bytes) asserts ttty Grid ==
-    oracle on cursor AND per-row screen text (rowText vs screenText).
-Process notes: execCmdEx/execShellCmd HANG in this shell — always posix
-fork/exec (spawnDetached in x11oracle). Build helper via direct
-`nim c -o:build/oracle_helper src/ttty/oracle_helper.nim`. Test binaries
-go in build/ (gitignored). x11 nimble pkg path via `nimble path x11`.
-Committed: 90fea5c (oracle) + c091a45 (gitignore). Media-copy pivot NOT yet
-committed (conformance.nim rewritten for text; test_conformance tool needs
-rebuild + rerun; old pixel procs cellDiffCounts/inkRows/ink REMOVED).
+Proven by ~15 controlled tests this session (Xvfb :88, python pty harness):
+- `xterm -e helper` = correct architecture (helper owns the slave ctty; xterm
+  answers DSR + Media Copy to it) but is BLOCKED by the sandbox: xterm opens
+  `/dev/tty` on startup, and the 3code sandbox allows `/dev/ptmx` + `/dev/pts`
+  but NOT `/dev/tty` -> `open ttydev: Permission denied`. A wrapper giving
+  xterm a controlling tty (setsid+TIOCSCTTY on a pre-opened slave) does NOT
+  help: the helper still never runs.
+- `xterm -S<fd>` = sandbox-compatible (no /dev/tty open, uses externally
+  allocated pty) but NEVER answers DSR (`CSI 6 n`) or Media Copy (`CSI 0 i`),
+  regardless of: helper on master, helper on slave (fresh open / O_NOCTTY),
+  ECHO on/off, master drain, slave-input priming, reading master vs slave,
+  foreground pgid, ctty-steal (TIOCSCTTY steal is also sandbox-denied). xterm
+  only honors these queries from a foreground program on its controlling tty,
+  which `-S` does not create.
+- Conclusion: under THIS sandbox there is no way to get xterm to answer DSR or
+  Media Copy. The screen-text ground truth (Media Copy) and cursor ground
+  truth (DSR) are both unavailable.
 
-STEPS 4-6 GREEN, committed (3ccc72d conformance+media-copy, 7e934cb corpus
-suite). tools/test_conformance: 10/10 sequences conform (plain, CR/LF, CR
-overwrite, cursor-up edit, EL, ED, walk-up erase, CUP, ICH, DCH).
-tests/test_x11_conformance.nim: all 6 real 3code corpus streams replayed
-through ttty AND fresh real xterm at 120x40 -> all conform. KEY LESSON:
-use a FRESH oracle per corpus stream (a shared xterm carries scroll state
-and produces false cursor divergences, e.g. leftover row-39 scroll).
-Existing test_grid suite still green. ttty had NO bugs on these streams —
-the model matches xterm. The 3code prompt-only drift bug is in 3code's
-walk-up MATH (what it emits), not in ttty's model, so ttty conformance
-passes while 3code still drifts on a real terminal. That is Step 9.
+Env facts:
+- ttty source checkout is `~/p/ttty` (nimble package, srcDir=src, needs x11).
+- oracle helper prebuilt at `~/p/ttty/build/oracle_helper`.
+- Real xterm bug repro captured at `/tmp/xt_clean.log` (4144 bytes,
+  ONLCR-intact, loses the hint); good-case `st` capture at
+  `/tmp/xhome/run/app.log`. Scratch, may not persist.
 
-CORPUS: tests/corpus/*.raw harvested from ~/p/3code/linebugs tty test
-captures (120x40, DefaultTtyCols/Rows). welcome_minimal, provider_typing
-_a/_b/_c, provider_stream_turn, resume_bar.
+RESOLVED — terminal is now configurable; use `st` as the oracle terminal when
+xterm's `-e` is sandbox-blocked.
 
-STEP 8 REVISED (committed ac9b60c): the earlier "drift reproduction" was a
-TEST ARTIFACT, not the bug. Root cause of the artifact: typeKeys did not
-hold Shift for shifted chars, so `:provider` was typed as `;provider`
-(unknown command -> error path -> messy screen that looked like drift).
-With typeKeys fixed to hold Shift, repeated `:provider stub` x3 renders
-PERFECTLY on real xterm: each echo + 3-line profile + proper blank-line
-separation + clean prompt, no eaten lines, no overlap, no anomalous drift.
-So CURRENT 3code is CORRECT for this sequence on xterm. The user's bug is
-real but environmental/timing-dependent (it was originally seen in foot,
-and spuriously). IMPORTANT LESSON: verify the injected input actually
-landed (dump the screen) before concluding an app bug — a corrupted input
-stream masquerades as the very walk-up corruption being tested.
+BREAKTHROUGH (same session, after the xterm dead-end): `st` (suckless
+terminal) provides the EXACT working architecture xterm `-e` was supposed to,
+but sandbox-legally:
+- `st -e helper` puts the helper on st's pty as its foreground program; st
+  allocates that pty via openpty (sandbox-allowed), NOT the /dev/tty path that
+  blocks xterm.
+- st renders the helper's output faithfully (verified: OCR of an openbox
+  screenshot reads the rendered text; window pixels composite under Xvfb,
+  unlike xterm `-S` whose window is blank).
+- st answers DSR `CSI 6 n` correctly (verified: rendered 3 rows + '> ' ->
+  DSR reply `[3;3` = row 3, col 3, exactly right).
+- So cursor ground truth (DSR) AND screen ground truth (rendering, read back
+  via X11 screenshot) BOTH work with `st -e`.
 
-New oracle capabilities (src/ttty/x11oracle.nim):
-  - startOracle(..., run = "<cmd>", runEnv = [(k,v)]): supervisor mode.
-    helper (oracle_helper.nim) forks the cmd as a sub-child sharing the
-    tty; xterm renders the REAL program, XTEST keystrokes reach it.
-  - typeKeys(text, delayMs): XTEST keystroke injection. CRITICAL: must
-    focusWindow() first (XSetInputFocus RevertToParent) — bare Xvfb has no
-    WM so nothing is focused by default and keystrokes vanish silently.
-  - screenText() + cursor() work in run mode too (helper services cmd
-    files; it must NOT read stdin in supervisor mode — the program owns it).
-
-Known side observation: after the first :provider, subsequent typed input
-partially desyncs (a `:` shows as `;` on screen) — consistent with the
-walk-up model being off after the first commit, exactly the bug. Do NOT
-treat as a test artifact.
-
-STEP 7 (ttty bugs): none found — ttty conforms on all 6 corpus streams +
-10 synthetic sequences. ttty's model is correct.
-
-REASSESSMENT (ac9b60c): 3code is NOT visibly buggy for the simple
-:provider sequence on xterm. The original bugs (status line hidden before
-first prompt; line above prompt erased; prompt jump on submit) were seen
-on foot and spuriously. They are likely TIMING (spinner/streaming races)
-or TERMINAL-specific (foot vs xterm rendering), which the clean
-:provider-only path does not exercise.
-
-Remaining work (folded in, not asking back):
-- Step 8b: reproduce the ACTUAL reported bugs, not the simplified one:
-  (a) streaming turn with a reasoning spinner active while typing (the
-  `test_slurp_resize_reasoning` / `test_typing_during_stream` scenarios)
-  driven through the oracle, asserting no scrollback line is eaten;
-  (b) submit transition (prompt echo -> spinner) watched for the one-row
-  prompt jump; (c) if reproducible on xterm, fix; if only on foot, note
-  that the oracle is xterm-specific and consider a foot oracle later.
-- Step 8c: make the terminaldbg probe (3code, src/threecode/terminaldbg.nim
-  + probeDetail in engine.nim) a permanent opt-in diagnostic rather than a
-  throwaway — it is what pinpoints stale walk-up components (ft/ed/lv) on
-  a real terminal. Decide whether to keep it in 3code mainline.
-- Step 9 (was "fix 3code drift"): now conditional on 8b reproducing a real
-  bug on xterm. If 8b reproduces, fix in ~/p/3code and re-verify oracle
-  red->green. If not, the ttty grounding stands on its own.
-- Step 10 DONE: ttty 0.4.0 released. `nimble conformance` runs the corpus
-  suite (all 6 streams conform). test_grid 74 OK, test_3code_contract 0
-  FAIL, release build clean. nimble file gains x11 dep + oraclehelper /
-  conformance tasks; README gains a Ground Truth section. Tagged 0.4.0,
-  pushed main + tag to origin, `nimble install` resolves ttty-0.4.0.
-
-OUTCOME SUMMARY: the ttty grounding is complete and released. ttty conforms
-to real xterm on all captured streams. The originally-reported 3code bugs
-did NOT reproduce on xterm (the simple :provider sequence and the
-streaming-during-typing scenario both render cleanly), and the one "drift"
-seen earlier was a typeKeys Shift artifact, now fixed. The real bugs are
-most likely foot-specific or a timing race the clean scenarios don't hit.
-The oracle + terminaldbg probe are the instruments to catch them when they
-next surface. 3code's terminaldbg probe (src/threecode/terminaldbg.nim +
-probeDetail) remains uncommitted on the linebugs branch — decide whether to
-mainline it as a permanent opt-in diagnostic (Step 8c) before closing.
+The plan's step 1 changes shape: rather than force xterm `-S` (which can't
+answer DSR/Media Copy), make the oracle terminal a parameter. Prefer xterm
+`-e` where it works (unsandboxed); fall back to `st -e` where xterm's /dev/tty
+open is denied. `oracleAvailable` should probe which terminal actually works,
+not just which binaries exist. st's Media Copy equivalent: st does not
+implement `CSI 0 i` printing, so screenText reads st's window back via X11
+pixels (screenshot + cell geometry, the ink-map the module header already
+describes) instead of a printerCommand pipe.
 
 ## Steps
 
-- [x] 1. Oracle spike GREEN. fork/exec Xvfb+xterm; XQueryTree window find;
-      XGetImage pixel readback at 6x13 px/cell. Channel = fork/exec + child
-  writes reply files; xterm queries via a Nim child helper on its own stdin.
-  execCmdEx hangs here — always posix fork/exec. See Current state.
-- [x] 2. `src/ttty/x11oracle.nim` DONE: startOracle(cols,rows)/feed/cursor/
-      inkRows/stop + oracleAvailable. Child helper is a prebuilt binary
-  (src/ttty/oracle_helper.nim -> build/oracle_helper), fork/exec Xvfb+xterm,
-  window found via XQueryTree title "oracle_helper". Cursor via helper
-  reading its own stdin DSR (exact, matches model). Committed 90fea5c.
-- [x] 3. Screen reader DONE: XGetImage / 6x13 cell -> per-cell ink map.
-      Background calibrated from pixel (0,0); a cell has ink when >=3 sampled
-  pixels differ from bg. Block cursor counts as ink at its cell (correct —
-  cursor query reports it; hide cursor via DECTCEM when only glyph ink is
-  wanted). tools/test_oracle.nim GREEN: 'hello'->cursor(0,5), ink cols0-4;
-  '\\r\\nworld'->cursor(1,5). No glyph->text decode (per user: ignore fonts/
-  pixels-as-appearance; text stays in ttty). Committed 90fea5c.
-- [ ] 4. `src/ttty/conformance.nim`: comparator feeding one byte stream to
-      ttty Grid + oracle, asserting cursor + ink agreement. Key mapping:
-  ttty cell (r,c) has text iff oracle ink(r,c), EXCLUDING the cursor cell
-  (oracle paints block cursor there; hide it via DECTCEM prefix during
-  replay so ink == text exactly). Compare row text too. Report first
-  divergence with full context.
-- [ ] 5. Harvest corpus: collect real `.raw` streams from ~/p/3code tty tests
-      into `tests/corpus/` with a small manifest (name + source scenario).
-  Include the prompt-only `:provider` sequence (the drift repro).
-- [ ] 6. Conformance suite `tests/test_x11_conformance.nim`: replay every
-      corpus stream, assert ttty == oracle. Self-skip cleanly when Xvfb/xterm
-  absent (CI gate via env). Expect initial FAILURES where ttty diverges.
-- [ ] 7. Fix ttty grid bugs the oracle exposes (each a focused fix + keep the
-      conformance test green). Record each divergence + root cause here.
-- [ ] 8. 3code end-to-end integration test: drive the real stub binary through
-      the oracle across its visual features (fresh prompt, :provider, a
-  streamed turn, resume-with-bar), incl. the prompt-only drift repro.
-- [ ] 9. Fix the 3code prompt-only under-walk bug (oracle red -> green).
-- [ ] 10. Full verification: ttty suite + 3code tty suite green; release build.
-      Cut ttty release (bump version, tag, push) per ~/p/.agents/release.md.
+1. [x] **Oracle: configurable terminal, xterm `-e` with st fallback.**
+   `xterm -e` is the correct architecture but is sandbox-blocked (xterm opens
+   `/dev/tty`, denied). `xterm -S` (external pty) maps a window but NEVER
+   answers DSR or Media Copy (proven by ~15 tests: no foreground program on
+   its tty). So `startOracle` now tries xterm `-e`, probes helper liveness
+   (xterm maps a window yet fails to spawn the helper when its pty setup is
+   denied), and falls back to `st -e` (st allocates via openpty, allowed, and
+   runs the helper as its foreground program, answering DSR). Changes:
+   `TerminalKind{termXterm,termSt}`; xterm helper-liveness probe before
+   accepting; st fallback by WM_CLASS ("st-256color"/"st"); recursive window
+   find (a WM reparents the terminal under its frame); openbox spawned for
+   compositing (tracked wmPid, killed in stop); X error handler swallowing
+   BadWindow from dying xterm; freeDisplay checks lock AND socket; helper
+   writes a `ready` marker the oracle waits on (fixes first-feed/DSR race);
+   feed settle; cursor retry; DSR works (verified cursor=(15,2) matches
+   grid); X11 ink-map readback for st (no Media Copy). Screen-text
+   comparison for st uses occupancy (ink vs grid non-blank) since exact text
+   needs OCR; cursor (DSR) is the reliable ground truth for the erased-row
+   bug class. Verified: 2 sequential runs give correct cursor; grid unit
+   tests 79 OK / 0 fail. Cosmetic XIO error on st shutdown (st's own
+   teardown, harmless).
+
+2. [ ] **Faithful corpus capture.** Add/refresh a capture path that records
+   the raw **pty master** bytes (ONLCR-intact, `\r\r\n` present) for the
+   conformance scenarios, at 80x24 (and keep 120x40 variants if cheap).
+   Replace the ONLCR-blind `tests/corpus/*.raw` with faithfully-captured
+   streams. Include the hint-loss scenario (startup + type + submit) so the
+   suite covers the bug class. Verify: new `.raw` files contain `\r\r\n` and
+   `\x1b[` walk-ups; the hint-loss capture reconstructs (via an independent
+   VT parser) to a screen missing the hint line.
+
+3. [ ] **ONLCR/cooked-output model in the grid.** Add an optional mode to
+   `Grid` (e.g. `cookedOutput: bool` defaulting false to preserve current
+   behavior) that, when enabled, applies the pty output transform to the byte
+   stream before interpretation: under ONLCR, a `\n` not preceded by `\r`
+   behaves as CR+LF (col 0 + linefeed), and an explicit `\r\n` collapses to a
+   single linefeed (the doubled `\r` is a no-op col-0). This lets ttty predict
+   xterm's physical result from **app-side** bytes, closing the
+   model-vs-physical gap for real. Unit tests in `tests/test_grid.nim`:
+   `\r\n` → one row advance; bare `\n` under cooked mode → col 0 + row
+   advance; `\r\r\n` → one row.
+
+4. [ ] **Wire the model into conformance + prove the desync is visible.**
+   `compareToOracle` gains a path that feeds **app-side** bytes to the
+   ONLCR-enabled grid and the **same** bytes (through the real pty, so xterm
+   sees the ONLCR-transformed stream) to the oracle, and asserts they agree.
+   Feed the step-2 hint-loss capture: confirm the suite now *fails* (or, if
+   fed oracle-side, that the grid-with-ONLCR matches xterm's loss),
+   demonstrating the harness can see the bug class. Verify: full
+   `nimble conformance` runs end-to-end under the sandbox and the hint-loss
+   stream is exercised.
+
+5. [ ] **Review + full verification.** Re-read the whole diff, confirm one
+   implementation per concept, no dead code. Build release + run
+   `tests/test_grid.nim`, `tests/test_3code_contract.nim`,
+   `tests/test_x11_conformance.nim`. Note any suite that can't run and why.
+   Commit per step (ttty has its own git repo).

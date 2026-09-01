@@ -150,16 +150,21 @@ describes) instead of a printerCommand pipe.
    replayed correctly). Suite now 17/17 (was 14). The suite runs
    end-to-end under the sandbox via the st fallback.
 
-3. [ ] **ONLCR/cooked-output model in the grid.** Add an optional mode to
-   `Grid` (e.g. `cookedOutput: bool` defaulting false to preserve current
-   behavior) that, when enabled, applies the pty output transform to the byte
-   stream before interpretation: under ONLCR, a `\n` not preceded by `\r`
-   behaves as CR+LF (col 0 + linefeed), and an explicit `\r\n` collapses to a
-   single linefeed (the doubled `\r` is a no-op col-0). This lets ttty predict
-   xterm's physical result from **app-side** bytes, closing the
-   model-vs-physical gap for real. Unit tests in `tests/test_grid.nim`:
-   `\r\n` → one row advance; bare `\n` under cooked mode → col 0 + row
-   advance; `\r\r\n` → one row.
+3. [x] **ONLCR/cooked-output model in the grid.** Added
+   `Grid.cookedOutput: bool` (default false = verbatim interpretation, the
+   terminal's own view) plus a `prevWasCr` tracker. When enabled, the feed
+   loop applies the pty OPOST/ONLCR transform: a `\n` not preceded by `\r`
+   also returns the carriage (col 0) before linefeed, while an explicit
+   `\r\n` already returned it (the doubled `\r` is a no-op). `prevWasCr` is
+   set on `\r`, cleared on `\n`, tab, backspace, ESC, and printable runes.
+   This lets a test feed APP-SIDE bytes (what the program wrote, before the
+   line discipline) and get the grid a real cooked-mode terminal shows,
+   closing the model-vs-physical gap. Unit tests in `tests/test_grid.nim`
+   (new suite "grid: cooked output (ONLCR) model"): `\r\n` -> one row; bare
+   `\n` -> CR+LF (col 0); `\r\r\n` -> one row; CSI before bare `\n` does not
+   count as `\r`. Removed a bogus raw-mode test (the grid's `lineFeed`
+   already returns carriage, which is terminal-correct). Grid tests 83 OK /
+   0 fail.
 
 4. [ ] **Wire the model into conformance + prove the desync is visible.**
    `compareToOracle` gains a path that feeds **app-side** bytes to the

@@ -71,6 +71,17 @@ type
     ## diverge, so they are always worth flagging.
     violations*: seq[string]
     syncOpen: bool
+    ## When true, model the pty output line discipline (OPOST/ONLCR) a real
+    ## terminal applies to an app's bytes: each `\n` NOT preceded by `\r`
+    ## becomes CR+LF (col 0 + linefeed), while an explicit `\r\n` stays one
+    ## linefeed. This lets a test feed APP-SIDE bytes (what the program
+    ## wrote, before the line discipline) and get the grid a real
+    ## cooked-mode terminal would show — closing the model-vs-physical gap
+    ## that hides scrollback desyncs when the harness interprets bytes with
+    ## the same model the app used to emit them. Default false: feed bytes
+    ## are interpreted verbatim (the terminal's own view).
+    cookedOutput*: bool
+    prevWasCr: bool
 
 proc hasAttr*(attrs: SgrAttr, bit: int): bool {.inline.} =
   (uint16(attrs) and (1'u16 shl uint16(bit))) != 0
@@ -483,18 +494,29 @@ proc feed*(g: Grid, bytes: string) =
     of '\r':
       g.col = 0
       g.pendingWrap = false
+      g.prevWasCr = true
       inc i
     of '\n':
+      # ONLCR: a linefeed not preceded by a carriage return also returns
+      # the carriage (col 0). An explicit `\r\n` already returned it, so the
+      # extra `\r` the line discipline inserts is a no-op col-0.
+      if g.cookedOutput and not g.prevWasCr:
+        g.col = 0
+        g.pendingWrap = false
       lineFeed(g)
+      g.prevWasCr = false
       inc i
     of '\t':
+      g.prevWasCr = false
       tab(g)
       inc i
     of '\b':
+      g.prevWasCr = false
       backspace(g)
       inc i
     of '\x1b':
-      if i + 1 < bytes.len and bytes[i + 1] == '[':
+      g.prevWasCr = false
+      if i + 1 < bytes.len and bytes[i + 1] == '[':  # CSI
         var j = i + 2
         var private = false
         if j < bytes.len and bytes[j] == '?':
@@ -590,6 +612,7 @@ proc feed*(g: Grid, bytes: string) =
       else:
         inc i
     else:
+      g.prevWasCr = false
       let rl = runeLenAt(bytes, i)
       let r = runeAt(bytes, i)
       putRune(g, r)

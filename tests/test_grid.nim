@@ -535,6 +535,46 @@ suite "grid: bracketed paste mode":
     g.feed("\x1b[?2004l")
     check not g.bracketedPaste
 
+suite "grid: cooked output (ONLCR) model":
+  test "explicit \\r\\n is one row advance in cooked mode":
+    let g = newGrid()
+    g.cookedOutput = true
+    g.feed("AB\r\nCD")
+    check rowText(g, 0) == "AB"
+    check rowText(g, 1) == "CD"
+    check g.row == 1
+
+  test "bare \\n in cooked mode returns carriage then linefeeds":
+    # ONLCR maps a lone \n to CR+LF: the next line starts at col 0, not
+    # under the previous line's tail. This is the transform that hides a
+    # scrollback desync when the harness replays app-side bytes verbatim.
+    let g = newGrid()
+    g.cookedOutput = true
+    g.feed("AB\nCD")
+    check rowText(g, 0) == "AB"
+    check rowText(g, 1) == "CD"
+    check g.row == 1
+    check g.col == 2
+
+  test "\\r\\r\\n is one row advance in cooked mode":
+    # The line discipline doubles an explicit \r\n to \r\r\n; the extra \r
+    # is a no-op col-0, so the row still advances exactly once.
+    let g = newGrid()
+    g.cookedOutput = true
+    g.feed("AB\r\r\nCD")
+    check rowText(g, 0) == "AB"
+    check rowText(g, 1) == "CD"
+    check g.row == 1
+
+  test "cooked mode preserves col after CSI before bare \\n":
+    # A CSI sequence between text and \n must not count as a \r: the bare
+    # \n still triggers the ONLCR carriage return.
+    let g = newGrid()
+    g.cookedOutput = true
+    g.feed("AB\x1b[36m\nCD")
+    check rowText(g, 0) == "AB"
+    check rowText(g, 1) == "CD"
+
 suite "input: queued bytes":
   test "text and key sequences are read in order":
     let input = newInput()

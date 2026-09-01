@@ -72,3 +72,27 @@ proc compareToOracle*(bytes: string; cols = 80, rows = 24;
 
 proc reportDivergence*(d: Divergence): string =
   "DIVERGENCE [" & d.kind & "] " & d.detail
+
+proc compareAppSide*(appBytes: string; cols = 80, rows = 24): tuple[ok: bool, dv: Divergence] =
+  ## Replay APP-SIDE bytes (what a program wrote to stdout, BEFORE the pty
+  ## line discipline transforms them) into a cooked-output Grid and a real
+  ## terminal, and assert they agree. The Grid gets `cookedOutput = true` so
+  ## it applies the same ONLCR transform the terminal's pty applies; the
+  ## terminal receives the bytes raw and its pty does the transform. If the
+  ## two disagree, the app's byte stream does not mean what the app thinks
+  ## it means on a real cooked terminal — the model-vs-physical desync made
+  ## visible. This is the check the verbatim `compareToOracle` cannot do.
+  let g = newGrid()
+  g.width = cols
+  g.height = rows
+  g.cookedOutput = true
+  let o = startOracle(cols, rows)
+  defer: o.stop()
+  g.feed(appBytes)
+  o.feed(appBytes)
+  let oc = o.cursor()
+  if oc.row != g.row or oc.col != g.col:
+    return (false, Divergence(kind: "cursor", row: oc.row,
+      detail: "app-side cooked: ttty cursor=(" & $g.row & "," & $g.col &
+        ") but terminal=(" & $oc.row & "," & $oc.col & ")"))
+  result = (true, Divergence())

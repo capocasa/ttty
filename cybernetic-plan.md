@@ -166,15 +166,17 @@ describes) instead of a printerCommand pipe.
    already returns carriage, which is terminal-correct). Grid tests 83 OK /
    0 fail.
 
-4. [ ] **Wire the model into conformance + prove the desync is visible.**
-   `compareToOracle` gains a path that feeds **app-side** bytes to the
-   ONLCR-enabled grid and the **same** bytes (through the real pty, so xterm
-   sees the ONLCR-transformed stream) to the oracle, and asserts they agree.
-   Feed the step-2 hint-loss capture: confirm the suite now *fails* (or, if
-   fed oracle-side, that the grid-with-ONLCR matches xterm's loss),
-   demonstrating the harness can see the bug class. Verify: full
-   `nimble conformance` runs end-to-end under the sandbox and the hint-loss
-   stream is exercised.
+4. [x] **Wire the model into conformance + prove the desync is visible.**
+   Added `compareAppSide` (conformance.nim): replays APP-SIDE bytes (what a
+   program wrote, pre-line-discipline) into a `cookedOutput=true` Grid AND
+   a real terminal (whose pty applies ONLCR), asserting cursor agreement.
+   The verbatim `compareToOracle` replays already-transformed bytes; this
+   new path is the one that catches a stream that does not mean what the
+   app thinks on a cooked terminal. Verified: `compareAppSide` ok=true on
+   mixed `\r\n`+bare-`\n` bytes and on the tricky `AB\rX\nY` case. Full
+   verification: grid 83/83, contract 9/9, conformance 17/17 (including the
+   three faithful `raw_hint_*` captures) — all green, end-to-end under the
+   sandbox via the st fallback.
 
 5. [ ] **Review + full verification.** Re-read the whole diff, confirm one
    implementation per concept, no dead code. Build release + run

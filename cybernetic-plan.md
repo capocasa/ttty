@@ -178,8 +178,14 @@ describes) instead of a printerCommand pipe.
    three faithful `raw_hint_*` captures) — all green, end-to-end under the
    sandbox via the st fallback.
 
-5. [ ] **Review + full verification.** Re-read the whole diff, confirm one
-   implementation per concept, no dead code. Build release + run
-   `tests/test_grid.nim`, `tests/test_3code_contract.nim`,
-   `tests/test_x11_conformance.nim`. Note any suite that can't run and why.
-   Commit per step (ttty has its own git repo).
+5. [x] **Review + full verification.** Whole diff reviewed; one
+   implementation per concept, no dead code (only the opt-in
+   `-d:debugOracle` traces remain, off by default). Release builds of all
+   three test binaries pass: grid 83/83, contract 9/9, x11 conformance
+   17/17 (including the three faithful `raw_hint_*` captures), all under
+   the sandbox via the st fallback. Committed per step across both repos:
+   ttty (oracle fallback + render-probe, faithful corpus, cookedOutput
+   grid model, compareAppSide) and 3code (`writeRawArtifact` +
+   `probe_capture_raw.nim`). Cosmetic only: st emits a benign XIO message
+   on shutdown; one cursor query is occasionally one retry slower under
+   load (absorbed by the 5x300ms retry).

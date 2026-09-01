@@ -237,16 +237,47 @@ proc startOracle*(cols = 80, rows = 24; workDir = ""; run = "";
        "-geometry", geom, "-e", helperBin],
       xenv)
     win = waitForWindow(result.dpy, "oracle_helper", 6000)
-    # xterm can map a window yet fail to spawn the helper: its internal pty
-    # setup (`-e` needs a pty pair) is denied by sandboxes that block
-    # /dev/tty, so the window sits empty and the helper never runs. Probe
-    # the helper with a no-op command; only accept xterm if it answers.
+    # xterm can map a window yet never become usable: its internal pty
+    # setup (`-e` needs a pty pair, and it opens /dev/tty) is denied by
+    # sandboxes, so it renders nothing and answers no DSR. Probe with a real
+    # cursor query and require a well-formed reply; an empty/absent answer
+    # means xterm is dead-in-the-water, so fall through to st.
     if win != 0:
-      writeFile(result.dir / "cmd_query", "")
+      # Probe by RENDERING then querying: xterm's helper can ack a bare
+      # query yet be unable to feed xterm's pty (the sandbox lets xterm map
+      # a window but blocks the pty it needs to render), so a query alone
+      # passes falsely. Render a marker (moves the cursor off home) and
+      # require the DSR to reflect it; a dead renderer stays at home.
+      writeFile(result.dir / "cmd_feed", "\x1b[999C")
+      var fed = true
       try:
         waitDone(result, 3000)
       except IOError:
-        win = 0  # helper dead -> reject xterm, fall through to st
+        fed = false
+      sleep 300
+      var probed = (0, 0)
+      if fed:
+        writeFile(result.dir / "cmd_query", "")
+        try:
+          waitDone(result, 3000)
+          let cursorF = result.dir / "cursor.txt"
+          let reply = if fileExists(cursorF): readFile(cursorF) else: ""
+          if reply.len >= 4 and reply[0] == '\x1b' and reply[^1] == 'R':
+            let body = reply[2 ..< ^1]
+            let semi = body.find(';')
+            if semi > 0:
+              let rr = try: parseInt(body[0 ..< semi]) except CatchableError: 0
+              let cc = try: parseInt(body[semi + 1 .. ^1]) except CatchableError: 0
+              probed = (max(0, rr - 1), max(0, cc - 1))
+        except IOError:
+          probed = (0, 0)
+      if probed == (0, 0):
+        win = 0
+      # Clean up the probe: home the cursor and drop the probe's cursor.txt
+      # so the first real cursor() call is not confused by probe leftovers.
+      writeFile(result.dir / "cmd_feed", "\x1b[H")
+      try: waitDone(result, 2000) except IOError: discard
+      removeFile(result.dir / "cursor.txt")
     if win == 0:
       if result.xtermPid > 0:
         discard kill(result.xtermPid, 15)
@@ -361,7 +392,8 @@ proc typeKeys*(o: Oracle; text: string; delayMs = 25) =
 proc cursorOnce(o: Oracle): tuple[row, col: int] =
   writeFile(o.dir / "cmd_query", "")
   o.waitDone()
-  let reply = readFile(o.dir / "cursor.txt")
+  let cursorF = o.dir / "cursor.txt"
+  let reply = if fileExists(cursorF): readFile(cursorF) else: ""
   # reply shape: ESC [ row ; col R  (1-based)
   if reply.len >= 4 and reply[0] == '\x1b' and reply[1] == '[' and
      reply[^1] == 'R':
@@ -378,11 +410,11 @@ proc cursor*(o: Oracle): tuple[row, col: int] =
   ## st occasionally drops the first DSR right after a feed burst (its pty
   ## input queue is still draining), so retry a couple of times before
   ## declaring the cursor unknown.
-  for _ in 0 ..< 3:
+  for _ in 0 ..< 5:
     let c = o.cursorOnce()
     if c.row >= 0:
       return c
-    sleep 120
+    sleep 300
   (0, 0)
 
 proc screenTextMediaCopy(o: Oracle): seq[string] =

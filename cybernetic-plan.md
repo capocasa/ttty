@@ -133,14 +133,22 @@ describes) instead of a printerCommand pipe.
    tests 79 OK / 0 fail. Cosmetic XIO error on st shutdown (st's own
    teardown, harmless).
 
-2. [ ] **Faithful corpus capture.** Add/refresh a capture path that records
-   the raw **pty master** bytes (ONLCR-intact, `\r\r\n` present) for the
-   conformance scenarios, at 80x24 (and keep 120x40 variants if cheap).
-   Replace the ONLCR-blind `tests/corpus/*.raw` with faithfully-captured
-   streams. Include the hint-loss scenario (startup + type + submit) so the
-   suite covers the bug class. Verify: new `.raw` files contain `\r\r\n` and
-   `\x1b[` walk-ups; the hint-loss capture reconstructs (via an independent
-   VT parser) to a screen missing the hint line.
+2. [x] **Faithful corpus capture.** Root cause found: 3code's
+   `tests/tty_expect.nim` `cleanRaw` (line 982) strips EVERY `\r`
+   (`elif raw[i] == '\r': inc i`), and `writeFrameArtifact` writes the
+   corpus `.raw` from it — so the existing corpus is ONLCR-blind BY DESIGN
+   (lone `\n` only), readable as VT test vectors but unable to carry the
+   line-discipline signal. `s.raw` itself holds the intact master bytes.
+   Changes: added `writeRawArtifact` (writes `s.raw` unmodified, `\r`
+   preserved) to 3code's tty_expect.nim; added
+   `tests/tty/probe_capture_raw.nim` driving startup + type + submit.
+   Captured three faithful streams into `tests/corpus/`:
+   `raw_hint_startup.raw`, `raw_hint_typed.raw`,
+   `raw_hint_submit_turn.raw` — all contain `\r\r\n` (67 in the submit
+   capture) and the hint text. Existing corpus KEPT (deliberate lone-`\n`
+   VT vectors; the `edge_*`/`provider_*` streams test wrap/erase fidelity,
+   replayed correctly). Suite now 17/17 (was 14). The suite runs
+   end-to-end under the sandbox via the st fallback.
 
 3. [ ] **ONLCR/cooked-output model in the grid.** Add an optional mode to
    `Grid` (e.g. `cookedOutput: bool` defaulting false to preserve current

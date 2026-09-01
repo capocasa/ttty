@@ -9,3 +9,6 @@ Thumbs.db
 tools/spike_oracle
 test_cdsens
 tests/test_grid
+tests/test_3code_contract
+tests/test_grid
+tests/test_x11_conformance

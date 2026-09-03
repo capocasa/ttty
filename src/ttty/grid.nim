@@ -644,3 +644,95 @@ proc cellFg*(g: Grid, r, c: int): Color =
 
 proc cellBg*(g: Grid, r, c: int): Color =
   g.cellAt(r, c).bgColor
+
+proc resize*(g: Grid, width, height: int) =
+  ## Resize grid to new dimensions. Preserves existing content, pads with
+  ## blanks if growing, truncates if shrinking. Scrollback is maintained.
+  g.width = width
+  g.height = height
+  # Ensure we have enough rows for the visible area
+  ensureRow(g, height - 1)
+  # Clamp cursor to new bounds
+  g.row = min(g.row, max(0, g.rows.len - 1))
+  g.col = min(g.col, max(0, width - 1))
+  # Trim scrollback if needed
+  trimScrollback(g)
+
+proc renderAnsi*(g: Grid, width, height: int): string =
+  ## Render grid contents as ANSI escape sequences. Clears screen, moves
+  ## cursor home, writes rows with attributes, resets at end.
+  result = "\x1b[2J\x1b[H"  # clear screen, home cursor
+  
+  for r in 0..<min(height, g.rows.len):
+    if r > 0:
+      result.add "\r\n"
+    var lastFg = colDefault
+    var lastBg = colDefault
+    var lastAttrs = SgrAttr(0)
+    var col = 0
+    for cell in g.rows[r]:
+      if col >= width: break
+      # Emit SGR if attributes changed
+      if cell.fgColor != lastFg or cell.bgColor != lastBg or cell.attrs.uint16 != lastAttrs.uint16:
+        var params: seq[string] = @["0"]  # reset
+        # Foreground
+        case cell.fgColor
+        of colDefault: discard
+        of colBlack: params.add "30"
+        of colRed: params.add "31"
+        of colGreen: params.add "32"
+        of colYellow: params.add "33"
+        of colBlue: params.add "34"
+        of colMagenta: params.add "35"
+        of colCyan: params.add "36"
+        of colWhite: params.add "37"
+        of colBrightBlack: params.add "90"
+        of colBrightRed: params.add "91"
+        of colBrightGreen: params.add "92"
+        of colBrightYellow: params.add "93"
+        of colBrightBlue: params.add "94"
+        of colBrightMagenta: params.add "95"
+        of colBrightCyan: params.add "96"
+        of colBrightWhite: params.add "97"
+        of col256: params.add "38;5;" & $cell.fgColorIdx
+        of colRgb: discard  # not supported in simple renderer
+        # Background
+        case cell.bgColor
+        of colDefault: discard
+        of colBlack: params.add "40"
+        of colRed: params.add "41"
+        of colGreen: params.add "42"
+        of colYellow: params.add "43"
+        of colBlue: params.add "44"
+        of colMagenta: params.add "45"
+        of colCyan: params.add "46"
+        of colWhite: params.add "47"
+        of colBrightBlack: params.add "100"
+        of colBrightRed: params.add "101"
+        of colBrightGreen: params.add "102"
+        of colBrightYellow: params.add "103"
+        of colBrightBlue: params.add "104"
+        of colBrightMagenta: params.add "105"
+        of colBrightCyan: params.add "106"
+        of colBrightWhite: params.add "107"
+        of col256: params.add "48;5;" & $cell.bgColorIdx
+        of colRgb: discard
+        # Attributes
+        if cell.attrs.hasAttr(saBold): params.add "1"
+        if cell.attrs.hasAttr(saDim): params.add "2"
+        if cell.attrs.hasAttr(saItalic): params.add "3"
+        if cell.attrs.hasAttr(saUnderline): params.add "4"
+        if cell.attrs.hasAttr(saBlink): params.add "5"
+        if cell.attrs.hasAttr(saReverse): params.add "7"
+        if cell.attrs.hasAttr(saStrikethrough): params.add "9"
+        result.add "\x1b[" & params.join(";") & "m"
+        lastFg = cell.fgColor
+        lastBg = cell.bgColor
+        lastAttrs = cell.attrs
+      if cell.text.len > 0:
+        result.add cell.text
+      else:
+        result.add " "
+      inc col
+  # Reset attributes at end
+  result.add "\x1b[0m"

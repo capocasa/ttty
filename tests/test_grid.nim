@@ -656,3 +656,62 @@ suite "grid: DEC 2026 sync frame validation":
     g.feed("c\x1b[?2026l")
     g.checkStreamClosed()
     check g.violations.len == 0
+
+suite "grid: DEC 2026 sync batching (xterm semantics)":
+  test "visible frame is frozen while a block is open":
+    let g = newGrid()
+    g.feed("before")
+    # Open a block and mutate inside it: the visible grid must still show
+    # the frozen pre-block frame, because xterm defers rendering.
+    g.feed("\x1b[?2026hINSIDE")
+    check g.rowText(0) == "before"
+    # End marker commits the block atomically.
+    g.feed("\x1b[?2026l")
+    check g.rowText(0) == "beforeINSIDE"
+
+  test "frozen frame survives a read boundary mid-block":
+    let g = newGrid()
+    g.feed("start")
+    g.feed("\x1b[?2026hPART1")
+    # A read lands here with the block still open: still frozen.
+    check g.rowText(0) == "start"
+    g.feed("PART2")
+    check g.rowText(0) == "start"
+    g.feed("\x1b[?2026l")
+    check g.rowText(0) == "startPART1PART2"
+
+  test "cursor is frozen with the frame during a block":
+    let g = newGrid()
+    g.feed("abc")
+    let (preRow, preCol) = (g.row, g.col)
+    g.feed("\x1b[?2026h\r\nxyz")
+    # The block moved the shadow cursor; the visible cursor is unchanged.
+    check (g.row, g.col) == (preRow, preCol)
+    g.feed("\x1b[?2026l")
+    check (g.row, g.col) != (preRow, preCol)
+
+  test "back-to-back blocks commit independent frames":
+    let g = newGrid()
+    g.feed("\x1b[?2026hAA\x1b[?2026l")
+    check g.rowText(0) == "AA"
+    g.feed("\x1b[?2026hBB\x1b[?2026l")
+    check g.rowText(0) == "AABB"
+
+  test "syncSnapshot observes the frozen frame mid-block":
+    let g = newGrid()
+    g.feed("base")
+    g.feed("\x1b[?2026hDELTA")
+    let snap = newGrid()
+    g.syncSnapshot(snap)
+    check snap.rowText(0) == "base"
+    g.feed("\x1b[?2026l")
+    g.syncSnapshot(snap)
+    check snap.rowText(0) == "baseDELTA"
+
+  test "unclosed block commits at stream end":
+    let g = newGrid()
+    g.feed("\x1b[?2026htail")
+    g.checkStreamClosed()
+    check g.rowText(0) == "tail"
+    check g.violations.len == 1
+    check "never closed" in g.violations[0]

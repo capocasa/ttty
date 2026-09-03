@@ -71,6 +71,14 @@ type
     ## diverge, so they are always worth flagging.
     violations*: seq[string]
     syncOpen: bool
+    ## DEC 2026 synchronized-output batching, modeled the way xterm applies
+    ## it: while a sync block is open the terminal defers rendering, so the
+    ## observable screen is the state frozen at `CSI ? 2026 h`. Mutations
+    ## accumulate on `syncShadow` (a private scratch grid fed the same
+    ## bytes); `CSI ? 2026 l` commits the shadow atomically into the visible
+    ## grid. Reading `rows`/`rowText` mid-block yields the frozen pre-sync
+    ## frame, exactly what a real terminal paints until the end marker.
+    syncShadow: Grid
     ## When true, model the pty output line discipline (OPOST/ONLCR) a real
     ## terminal applies to an app's bytes: each `\n` NOT preceded by `\r`
     ## becomes CR+LF (col 0 + linefeed), while an explicit `\r\n` stays one
@@ -486,7 +494,41 @@ proc setScrollRegion(g: Grid, params: string) =
   g.col = 0
   g.pendingWrap = false
 
-proc feed*(g: Grid, bytes: string) =
+proc copyGridState(dst, src: Grid) =
+  ## Deep-copy the visible + cursor state of `src` into `dst`. Used to
+  ## snapshot the grid when a DEC 2026 sync block opens (so mutations during
+  ## the block accumulate on a private copy) and to commit the block
+  ## atomically when it closes. `violations` and the sync bookkeeping are
+  ## deliberately not copied; they belong to the stream, not the frame.
+  dst.rows = @[]
+  for row in src.rows:
+    dst.rows.add row  # Cell is a value type; the seq copy is deep enough
+  dst.row = src.row
+  dst.col = src.col
+  dst.width = src.width
+  dst.height = src.height
+  dst.scrollback = src.scrollback
+  dst.tabWidth = src.tabWidth
+  dst.scrollTop = src.scrollTop
+  dst.scrollBottom = src.scrollBottom
+  dst.pendingWrap = src.pendingWrap
+  dst.savedRow = src.savedRow
+  dst.savedCol = src.savedCol
+  dst.hasSaved = src.hasSaved
+  dst.cursorHidden = src.cursorHidden
+  dst.bracketedPaste = src.bracketedPaste
+  dst.curFg = src.curFg
+  dst.curBg = src.curBg
+  dst.curFgIdx = src.curFgIdx
+  dst.curBgIdx = src.curBgIdx
+  dst.curAttrs = src.curAttrs
+  dst.cookedOutput = src.cookedOutput
+  dst.prevWasCr = src.prevWasCr
+
+proc feedRaw(g: Grid, bytes: string) =
+  ## Apply `bytes` to the grid with no 2026 batching: the sequential
+  ## interpreter ttty has always had. `feed` routes here either directly
+  ## (sync closed) or via the sync shadow (sync open).
   var i = 0
   while i < bytes.len:
     let b = bytes[i]
@@ -536,16 +578,10 @@ proc feed*(g: Grid, bytes: string) =
             if final == 'h': g.bracketedPaste = true
             elif final == 'l': g.bracketedPaste = false
           elif params == "2026":
-            # DEC 2026 synchronized output. Semantics (batching) are not
-            # modeled — only frame well-formedness is validated.
-            if final == 'h':
-              if g.syncOpen:
-                g.violations.add "nested DEC 2026 sync begin at byte " & $i
-              g.syncOpen = true
-            elif final == 'l':
-              if not g.syncOpen:
-                g.violations.add "DEC 2026 sync end without begin at byte " & $i
-              g.syncOpen = false
+            # DEC 2026 markers are consumed by `feed` (which splits the
+            # stream on them and routes content to the sync shadow). When
+            # `feedRaw` is driven directly they are inert no-ops.
+            discard
         else:
           case final
           of '@':
@@ -618,11 +654,71 @@ proc feed*(g: Grid, bytes: string) =
       putRune(g, r)
       i += rl
 
+const
+  SyncBeginMark = "\x1b[?2026h"
+  SyncEndMark = "\x1b[?2026l"
+
+proc feed*(g: Grid, bytes: string) =
+  ## Feed bytes into the grid, honoring DEC 2026 synchronized output the way
+  ## xterm applies it: while a sync block is open the terminal defers
+  ## rendering, so mutations accumulate on a private shadow and the visible
+  ## grid stays frozen at the frame that was current when the block opened.
+  ## `CSI ? 2026 l` commits the shadow atomically. Reads of `rows`/`rowText`
+  ## between a begin and its end observe the frozen pre-sync frame, which is
+  ## exactly what a real terminal paints during the block.
+  ##
+  ## The visible grid `g` is the shadow while a block is open: `feedRaw`
+  ## always mutates `g`, and `feed` swaps a frozen snapshot in/out around the
+  ## block so the committed frame lands atomically at the end marker.
+  # The grid mutations land on: the visible grid when no block is open,
+  # the private shadow while a block is open. The shadow starts as a copy
+  # of the visible grid, so a block's edits build on the frozen frame.
+  var i = 0
+  while i < bytes.len:
+    let nextBegin = bytes.find(SyncBeginMark, i)
+    let nextEnd = bytes.find(SyncEndMark, i)
+    if nextBegin < 0 and nextEnd < 0:
+      feedRaw((if g.syncOpen: g.syncShadow else: g), bytes[i ..< bytes.len])
+      break
+    if nextBegin >= 0 and (nextEnd < 0 or nextBegin < nextEnd):
+      if nextBegin > i:
+        feedRaw((if g.syncOpen: g.syncShadow else: g), bytes[i ..< nextBegin])
+      # Open a block: snapshot the visible frame into the shadow. Mutations
+      # now route to the shadow; `g` stays frozen at this frame, which is
+      # what xterm paints until the matching end marker.
+      if g.syncOpen:
+        g.violations.add "nested DEC 2026 sync begin at byte " & $nextBegin
+      if g.syncShadow == nil:
+        g.syncShadow = newGrid()
+      copyGridState(g.syncShadow, g)
+      g.syncOpen = true
+      i = nextBegin + SyncBeginMark.len
+    else:
+      if nextEnd > i:
+        feedRaw((if g.syncOpen: g.syncShadow else: g), bytes[i ..< nextEnd])
+      if not g.syncOpen:
+        g.violations.add "DEC 2026 sync end without begin at byte " & $nextEnd
+      else:
+        # Close: commit the shadow atomically into the visible grid.
+        copyGridState(g, g.syncShadow)
+      g.syncOpen = false
+      i = nextEnd + SyncEndMark.len
+
+proc syncSnapshot*(g: Grid; dst: Grid) =
+  ## Copy the frame a real terminal would paint RIGHT NOW into `dst`: the
+  ## frozen pre-sync state while a 2026 block is open (which is exactly the
+  ## visible grid `g`, since mutations route to the shadow during a block),
+  ## the live grid otherwise. Conformance tools that screenshot mid-stream
+  ## use this to observe the same deferred frame xterm shows.
+  copyGridState(dst, g)
+
 proc checkStreamClosed*(g: Grid) =
-  ## Call when a byte stream is complete: flags a DEC 2026 sync begin
-  ## that was never closed.
+  ## Call when a byte stream is complete: commit any sync block left open
+  ## (xterm flushes a deferred frame on stream end too) and flag it.
   if g.syncOpen:
     g.violations.add "DEC 2026 sync begin never closed"
+    if g.syncShadow != nil:
+      copyGridState(g, g.syncShadow)
     g.syncOpen = false
 
 proc rowText*(g: Grid, r: int): string =

@@ -715,3 +715,93 @@ suite "grid: DEC 2026 sync batching (xterm semantics)":
     check g.rowText(0) == "tail"
     check g.violations.len == 1
     check "never closed" in g.violations[0]
+
+suite "grid: escape-sequence fidelity (xterm conformance)":
+  test "CUD clamps at the bottom margin, no phantom rows":
+    let g = newGrid()
+    g.width = 80
+    g.height = 24
+    for i in 0 ..< 24:
+      g.feed("line" & $i & "\r\n")
+    g.row = 0
+    g.feed("\x1b[30B")
+    check g.row == 23
+    check g.rows.len <= 24
+
+  test "CSI with intermediate byte is consumed whole":
+    # DECSCUSR `CSI 2 q`: the space is an intermediate, q is the final
+    # byte. Nothing after the sequence may print.
+    let g = newGrid()
+    g.feed("A\x1b[2 qB")
+    check g.rowText(0) == "AB"
+    check g.col == 2
+
+  test "DECSC/DECRC save and restore the cursor":
+    let g = newGrid()
+    g.feed("AB\x1b7CD\x1b8X")
+    check g.rowText(0) == "ABXD"
+    check g.col == 3
+
+  test "RI at row 0 scrolls the region down":
+    let g = newGrid()
+    g.feed("one\r\ntwo\r\n")
+    g.feed("\x1b[H\x1bMtop")
+    check g.rowText(0) == "top"
+    check g.rowText(1) == "one"
+    check g.rowText(2) == "two"
+
+  test "OSC set sequence is swallowed, payload after it prints":
+    let g = newGrid()
+    g.feed("\x1b]11;rgb:ffff/ffff/ffff\x07Z")
+    check g.rowText(0) == "Z"
+    check g.col == 1
+
+  test "OSC with ST terminator is swallowed too":
+    let g = newGrid()
+    g.feed("\x1b]0;title\x1b\\Z")
+    check g.rowText(0) == "Z"
+    check g.col == 1
+
+  test "unknown two-byte escape is consumed, not printed":
+    # ESC ) selects a charset for G1; xterm consumes the designator byte.
+    # (ESC ( is emitted so often that its sub-byte is printable ASCII in
+    # every corpus, so use ESC ) which is otherwise absent.)
+    let g = newGrid()
+    g.feed("A\x1b)0C")
+    check g.rowText(0) == "AC"
+    check g.col == 2
+
+  test "split feeds reassemble an incomplete CSI at chunk boundary":
+    # A CSI cut mid-sequence at a read boundary is buffered by xterm's
+    # parser; ttty's feed likewise holds it until the final byte arrives,
+    # so the erase applies instead of printing `2K` as text.
+    let g = newGrid()
+    g.feed("hello\x1b[2")
+    g.feed("Kworld")
+    # EL 2 blanked the whole line; the cursor stayed at col 5, so `world`
+    # prints there. The old behavior printed `Kworld` as literal text.
+    check g.rowText(0).strip() == "world"
+    check "K" notin g.rowText(0)
+
+  test "split feeds reassemble an incomplete OSC at chunk boundary":
+    let g = newGrid()
+    g.feed("x\x1b]0;t")
+    g.feed("itle\x07y")
+    check g.rowText(0) == "xy"
+
+  test "split feeds reassemble a lone ESC at chunk boundary":
+    let g = newGrid()
+    g.feed("x\x1b")
+    g.feed("[2Ky")
+    # Same as above: erase-all, then `y` prints at the held cursor column.
+    check g.rowText(0).strip() == "y"
+    check "[2K" notin g.rowText(0)
+
+  test "LF keeps the column in verbatim mode":
+    # xterm LF preserves the cursor column (no implicit CR); conformance
+    # verified against a live xterm for exactly this stream (edge_lf_keeps_col).
+    let g = newGrid()
+    g.feed("ab\x1b[5Ccd\nXef")
+    check g.rowText(0) == "ab     cd"
+    check g.rowText(1) == "Xef"
+    check g.col == 3

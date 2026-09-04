@@ -90,6 +90,11 @@ type
     ## are interpreted verbatim (the terminal's own view).
     cookedOutput*: bool
     prevWasCr: bool
+    ## A CSI/OSC cut off at the end of a `feed` chunk is held here until
+    ## the next chunk completes it, exactly like a real terminal's parser:
+    ## xterm buffers a partial escape instead of dropping the head and
+    ## printing the tail as text when the rest of the read arrives.
+    heldEsc: string
 
 proc hasAttr*(attrs: SgrAttr, bit: int): bool {.inline.} =
   (uint16(attrs) and (1'u16 shl uint16(bit))) != 0
@@ -524,6 +529,9 @@ proc copyGridState(dst, src: Grid) =
   dst.curAttrs = src.curAttrs
   dst.cookedOutput = src.cookedOutput
   dst.prevWasCr = src.prevWasCr
+  # A held partial escape is stream position, not frame content; carrying
+  # it into a sync shadow would replay the head twice at commit.
+  dst.heldEsc = ""
 
 proc feedRaw(g: Grid, bytes: string) =
   ## Apply `bytes` to the grid with no 2026 batching: the sequential
@@ -567,6 +575,12 @@ proc feedRaw(g: Grid, bytes: string) =
         while j < bytes.len and (bytes[j] in {'0'..'9'} or bytes[j] == ';'):
           params.add bytes[j]
           inc j
+        # Intermediate bytes (0x20-0x2F) sit between params and the final
+        # byte (DECSCUSR `CSI 2 q`); skip them so the final byte is the
+        # sequence terminator, not the intermediate, and the payload after
+        # it is not printed as text (raw_hint_* conformance).
+        while j < bytes.len and bytes[j] in {' '..'/'}:
+          inc j
         if j >= bytes.len:
           i = j; continue
         let final = bytes[j]
@@ -590,7 +604,12 @@ proc feedRaw(g: Grid, bytes: string) =
             g.row = max(0, g.row - parseN(params))
             g.pendingWrap = false
           of 'B':
-            g.row += parseN(params); ensureRow(g, g.row)
+            # CUD stops at the bottom margin like xterm, never walks past
+            # the visible screen into phantom rows (edge_cud_bottom_clamp).
+            g.row += parseN(params)
+            if g.height > 0:
+              g.row = min(g.row, scrollBottomDefault(g))
+            ensureRow(g, g.row)
             g.pendingWrap = false
           of 'C':
             g.col += parseN(params)
@@ -645,6 +664,52 @@ proc feedRaw(g: Grid, bytes: string) =
             ensureRow(g, g.row)
           else: discard
         i = j + 1
+      elif i + 1 < bytes.len:
+        # Non-CSI escapes. Unhandled ones must be consumed whole, not
+        # dropped after ESC with their payload printed as text (xterm
+        # swallows the sequence; edge_decsc/edge_osc_query/edge_ri).
+        case bytes[i + 1]
+        of '(', ')', '*', '+':  # charset designation: ESC ( I etc.
+          # The designator byte after the selector belongs to the sequence.
+          if i + 2 < bytes.len:
+            inc i
+          inc i; inc i
+        of '7':  # DECSC
+          g.savedRow = g.row; g.savedCol = g.col; g.hasSaved = true
+          inc i; inc i
+        of '8':  # DECRC
+          if g.hasSaved:
+            g.row = g.savedRow; g.col = g.savedCol
+            g.pendingWrap = false
+            ensureRow(g, g.row)
+          inc i; inc i
+        of 'M':  # RI: cursor up, scrolling the region down at the top
+          dec g.row
+          if g.row < 0:
+            g.row = 0
+            let (top, bottom) = scrollBounds(g)
+            scrollRegionDown(g, top, bottom, 1)
+          inc i; inc i
+        of 'D':  # IND: linefeed honoring the scroll region
+          lineFeed(g)
+          inc i; inc i
+        of 'E':  # NEL: CR + IND
+          g.col = 0
+          lineFeed(g)
+          inc i; inc i
+        of ']':  # OSC: swallow through BEL or ST
+          var j = i + 2
+          while j < bytes.len and bytes[j] != '\x07' and
+              not (bytes[j] == '\x1b' and j + 1 < bytes.len and
+                   bytes[j + 1] == '\\'):
+            inc j
+          if j < bytes.len:
+            inc j
+            if j < bytes.len and bytes[j - 1] == '\x1b':
+              inc j
+          i = j
+        else:  # two-byte escape (charset etc.): consume ESC + next
+          inc i; inc i
       else:
         inc i
     else:
@@ -658,7 +723,58 @@ const
   SyncBeginMark = "\x1b[?2026h"
   SyncEndMark = "\x1b[?2026l"
 
-proc feed*(g: Grid, bytes: string) =
+proc splitHeldEscape*(bytes: string): tuple[complete, held: string] =
+  ## Split `bytes` into the prefix that ends on a whole escape sequence and
+  ## a trailing incomplete one. A CSI is complete when a final byte in
+  ## `@`..`~` follows the params (and any intermediates); a private `?`
+  ## marker is part of the sequence. An OSC is complete at BEL or ST. A
+  ## lone trailing ESC (its next byte has not arrived) is held too.
+  if bytes.len == 0:
+    return
+  var i = 0
+  var cut = -1
+  while i < bytes.len:
+    if bytes[i] == '\x1b':
+      if i + 1 >= bytes.len:
+        cut = i
+        break
+      case bytes[i + 1]
+      of '[':
+        var j = i + 2
+        if j < bytes.len and bytes[j] == '?':
+          inc j
+        while j < bytes.len and (bytes[j] in {'0'..'9', ';'} or
+            (bytes[j] >= ' ' and bytes[j] <= '/')):
+          inc j
+        if j >= bytes.len:
+          cut = i
+          break
+        i = j + 1
+        continue
+      of ']':
+        var j = i + 2
+        while j < bytes.len and bytes[j] != '\x07' and
+            not (bytes[j] == '\x1b' and j + 1 < bytes.len and
+                 bytes[j + 1] == '\\'):
+          inc j
+        if j >= bytes.len:
+          cut = i
+          break
+        if bytes[j] == '\x1b':
+          inc j
+        i = j + 1
+        continue
+      else:
+        # Two-byte escape: complete by definition.
+        i = i + 2
+        continue
+    inc i
+  if cut >= 0:
+    result = (bytes[0 ..< cut], bytes[cut ..< bytes.len])
+  else:
+    result = (bytes, "")
+
+proc feed*(g: Grid, chunk: string) =
   ## Feed bytes into the grid, honoring DEC 2026 synchronized output the way
   ## xterm applies it: while a sync block is open the terminal defers
   ## rendering, so mutations accumulate on a private shadow and the visible
@@ -673,6 +789,19 @@ proc feed*(g: Grid, bytes: string) =
   # The grid mutations land on: the visible grid when no block is open,
   # the private shadow while a block is open. The shadow starts as a copy
   # of the visible grid, so a block's edits build on the frozen frame.
+  #
+  # A partial escape held over from the previous chunk is prepended first;
+  # the split below then operates on the reassembled stream, so a sync
+  # marker or sequence split across a read boundary is seen whole.
+  var bytes = chunk
+  if g.heldEsc.len > 0:
+    bytes = g.heldEsc & chunk
+    g.heldEsc = ""
+  let (completeBytes, held) = splitHeldEscape(bytes)
+  g.heldEsc = held
+  if completeBytes.len == 0:
+    return
+  bytes = completeBytes
   var i = 0
   while i < bytes.len:
     let nextBegin = bytes.find(SyncBeginMark, i)

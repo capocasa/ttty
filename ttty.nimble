@@ -1,4 +1,4 @@
-version       = "0.5.2"
+version       = "0.5.3"
 author        = "Carlo Capocasa"
 description   = "Headless ANSI VT grid renderer, with a real-xterm ground-truth oracle"
 license       = "MIT"

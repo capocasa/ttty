@@ -805,3 +805,109 @@ suite "grid: escape-sequence fidelity (xterm conformance)":
     check g.rowText(0) == "ab     cd"
     check g.rowText(1) == "Xef"
     check g.col == 3
+
+suite "grid: alternate screen (DECSET 1049/1047/1048)":
+  test "1049 parks main screen and restores it on exit":
+    let g = newGrid()
+    g.height = 3
+    g.feed("main\r\none\r\ntwo")
+    g.feed("\x1b[?1049h")
+    check g.rowText(0) == ""
+    g.feed("alt text")
+    check g.rowText(0) == "alt text"
+    check g.rows.len <= 3  # alt screen does not grow scrollback
+    g.feed("\x1b[?1049l")
+    check g.rowText(0) == "main"
+    check g.rowText(1) == "one"
+    check g.rowText(2) == "two"
+
+  test "1049 restores the cursor to its pre-entry position":
+    let g = newGrid()
+    g.height = 5
+    g.feed("abc")           # cursor at row 0, col 3
+    g.feed("\x1b[?1049h")
+    g.feed("\x1b[3;3Hxyz")  # move somewhere else on the alt screen
+    g.feed("\x1b[?1049l")
+    check g.row == 0
+    check g.col == 3
+
+  test "1049 re-entry starts from a blank alt screen":
+    let g = newGrid()
+    g.height = 3
+    g.feed("\x1b[?1049hfirst")
+    g.feed("\x1b[?1049l")
+    g.feed("\x1b[?1049h")
+    check g.rowText(0) == ""
+
+  test "alt screen scrolling does not pollute main scrollback":
+    let g = newGrid()
+    g.height = 2
+    g.scrollback = 10
+    g.feed("keep1\r\nkeep2")
+    g.feed("\x1b[?1049h")
+    for i in 0..<10:
+      g.feed("alt" & $i & "\r\n")
+    # alt screen scrolled: oldest alt rows dropped off the top, none of
+    # them leaked into the main screen's scrollback budget
+    check g.rows.len <= 2
+    for i in 0 ..< g.rows.len:
+      check g.rowText(i).startsWith("alt") or g.rowText(i) == ""
+    g.feed("\x1b[?1049l")
+    check g.rowText(0) == "keep1"
+    check g.rowText(1) == "keep2"
+    # main screen + its scrollback survived the alt-screen churn
+    check g.rows.len <= 2 + 10
+
+  test "1048 saves and restores the cursor without switching screens":
+    let g = newGrid()
+    g.height = 3
+    g.feed("hello")
+    g.feed("\x1b[?1048h")
+    g.feed("\x1b[2;1H")
+    g.feed("\x1b[?1048l")
+    check g.row == 0
+    check g.col == 5
+    check g.rowText(0) == "hello"
+
+suite "grid: renderAnsi visible-screen and full-model render":
+  test "renderAnsi shows the last rows, not the first, when scrollback exists":
+    let g = newGrid()
+    g.height = 2
+    g.scrollback = 10
+    g.feed("old1\r\nold2\r\nnew1\r\nnew2")
+    let snap = g.renderAnsi(80, 2)
+    check "new1" in snap
+    check "new2" in snap
+    check "old1" notin snap
+    check "old2" notin snap
+
+  test "renderAnsi with no scrollback is unchanged":
+    let g = newGrid()
+    g.height = 24
+    g.feed("hello")
+    let snap = g.renderAnsi(80, 24)
+    check snap.startsWith("\x1b[2J\x1b[H")
+    check "hello" in snap
+
+  test "renderAnsiFull emits scrollback then the screen":
+    let g = newGrid()
+    g.height = 2
+    g.scrollback = 10
+    g.feed("hist1\r\nhist2\r\nscr1\r\nscr2")
+    let full = g.renderAnsiFull()
+    check "hist1" in full
+    check "hist2" in full
+    check "scr1" in full
+    check "scr2" in full
+    check full.find("hist1") < full.find("scr1")
+    # the screen part is preceded by a clear+home so live output can follow
+    check "\x1b[2J\x1b[H" in full
+    check full.rfind("\x1b[2J\x1b[H") > full.find("hist2")
+
+  test "renderAnsiFull with no history is just the screen render":
+    let g = newGrid()
+    g.height = 24
+    g.feed("solo")
+    let full = g.renderAnsiFull()
+    check "solo" in full
+    check full.startsWith("\x1b[2J\x1b[H")

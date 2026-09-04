@@ -95,6 +95,16 @@ type
     ## xterm buffers a partial escape instead of dropping the head and
     ## printing the tail as text when the rest of the read arrives.
     heldEsc: string
+    ## Alternate screen (DECSET 1047/1048/1049). The main screen is parked
+    ## while the alt grid receives all mutations; `?1049l`/`?1047l` swaps
+    ## it back. xterm keeps scrollback only on the main screen: the alt
+    ## grid scrolls by dropping rows off the top, never into scrollback.
+    altGrid: Grid
+    onAltScreen: bool
+    ## The column the cursor returns to when the alt screen is left.
+    ## xterm (not plain DECSC/DECRC) restores the cursor position captured
+    ## at alt-screen entry.
+    altHomeRow, altHomeCol: int
 
 proc hasAttr*(attrs: SgrAttr, bit: int): bool {.inline.} =
   (uint16(attrs) and (1'u16 shl uint16(bit))) != 0
@@ -156,6 +166,14 @@ proc padTo(row: var seq[Cell], col: int, fg: Color, bg: Color,
 
 proc trimScrollback(g: Grid) =
   if g.height <= 0: return
+  # The alt screen has no scrollback: its scrolled rows drop off the top
+  # instead of accumulating (xterm keeps history only for the main screen).
+  if g.onAltScreen:
+    let visible = max(1, g.height)
+    while g.rows.len > visible:
+      g.rows.delete(0)
+      g.row = max(0, g.row - 1)
+    return
   let keep = max(1, g.height + max(0, g.scrollback))
   while g.rows.len > keep:
     g.rows.delete(0)
@@ -533,6 +551,76 @@ proc copyGridState(dst, src: Grid) =
   # it into a sync shadow would replay the head twice at commit.
   dst.heldEsc = ""
 
+proc enterAltScreen(g: Grid) =
+  ## DECSET 1049/1047: park the main screen, start (or resume) a blank
+  ## alt grid with the same geometry but no scrollback, remembering where
+  ## the cursor came from. 1048-only does not switch screens; it is handled
+  ## by its own DECSC/DECRC case below.
+  if g.altGrid == nil:
+    g.altGrid = newGrid()
+    g.altGrid.width = g.width
+    g.altGrid.height = g.height
+    g.altGrid.tabWidth = g.tabWidth
+    g.altGrid.curFg = g.curFg
+    g.altGrid.curBg = g.curBg
+    g.altGrid.curFgIdx = g.curFgIdx
+    g.altGrid.curBgIdx = g.curBgIdx
+    g.altGrid.curAttrs = g.curAttrs
+  else:
+    # Re-entry reuses the parked alt grid only under 1047 (its save/restore
+    # semantics); 1049 clears on entry.
+    discard
+  if g.onAltScreen:
+    return
+  g.altHomeRow = g.row
+  g.altHomeCol = g.col
+  # Park: swap main state into altGrid storage, then blank the visible grid
+  let parked = g.altGrid
+  copyGridState(parked, g)
+  # Parked main screen keeps its scrollback budget; the alt screen's own
+  # scrollback stays 0 (xterm: alt screens do not scroll into history).
+  parked.scrollback = g.scrollback
+  g.rows = @[blankRow()]
+  g.row = 0
+  g.col = 0
+  g.pendingWrap = false
+  g.scrollTop = 0
+  g.scrollBottom = 0
+  g.hasSaved = false
+  g.syncOpen = false
+  g.syncShadow = nil
+  g.onAltScreen = true
+
+proc leaveAltScreen(g: Grid, clearAlt: bool, restoreCursor: bool) =
+  ## DECRST 1049/1047: swap the parked main screen back. 1047 keeps the alt
+  ## grid's contents for a later re-entry, 1049 discards them; both leave
+  ## the cursor where it was when the alt screen was entered (xterm
+  ## behavior, stronger than the DECSC/DECRC that some emulators pair with
+  ## 1047).
+  if not g.onAltScreen:
+    return
+  let savedCursor = (g.row, g.col)
+  let parked = g.altGrid
+  copyGridState(g, parked)
+  g.onAltScreen = false
+  g.syncShadow = nil
+  g.syncOpen = false
+  if restoreCursor:
+    g.row = g.altHomeRow
+    g.col = g.altHomeCol
+    g.pendingWrap = false
+  else:
+    (g.row, g.col) = savedCursor
+  if clearAlt:
+    g.altGrid = nil
+  else:
+    # Keep the alt grid for 1047 re-entry: refill it blank with current
+    # geometry so a later `?1047h` starts clean without resurrecting stale
+    # content.
+    g.altGrid = newGrid()
+    g.altGrid.width = g.width
+    g.altGrid.height = g.height
+
 proc feedRaw(g: Grid, bytes: string) =
   ## Apply `bytes` to the grid with no 2026 batching: the sequential
   ## interpreter ttty has always had. `feed` routes here either directly
@@ -591,6 +679,24 @@ proc feedRaw(g: Grid, bytes: string) =
           elif params == "2004":
             if final == 'h': g.bracketedPaste = true
             elif final == 'l': g.bracketedPaste = false
+          elif params == "1047":
+            if final == 'h': g.enterAltScreen()
+            elif final == 'l': g.leaveAltScreen(clearAlt = false,
+                                                restoreCursor = false)
+          elif params == "1048":
+            # Cursor save/restore only, no screen switch.
+            if final == 'h':
+              g.savedRow = g.row
+              g.savedCol = g.col
+              g.hasSaved = true
+            elif final == 'l' and g.hasSaved:
+              g.row = g.savedRow
+              g.col = g.savedCol
+              g.pendingWrap = false
+          elif params == "1049":
+            if final == 'h': g.enterAltScreen()
+            elif final == 'l': g.leaveAltScreen(clearAlt = true,
+                                                restoreCursor = true)
           elif params == "2026":
             # DEC 2026 markers are consumed by `feed` (which splits the
             # stream on them and routes content to the sync shadow). When
@@ -883,20 +989,16 @@ proc resize*(g: Grid, width, height: int) =
   # Trim scrollback if needed
   trimScrollback(g)
 
-proc renderAnsi*(g: Grid, width, height: int): string =
-  ## Render grid contents as ANSI escape sequences. Clears screen, moves
-  ## cursor home, writes rows with attributes, resets at end.
-  result = "\x1b[2J\x1b[H"  # clear screen, home cursor
-  
-  for r in 0..<min(height, g.rows.len):
+proc renderRows(g: Grid, rows: seq[seq[Cell]], width: int): string =
+  for r in 0 ..< rows.len:
     if r > 0:
       result.add "\r\n"
     var lastFg = colDefault
     var lastBg = colDefault
     var lastAttrs = SgrAttr(0)
     var col = 0
-    for cell in g.rows[r]:
-      if col >= width: break
+    for cell in rows[r]:
+      if width > 0 and col >= width: break
       # Emit SGR if attributes changed
       if cell.fgColor != lastFg or cell.bgColor != lastBg or cell.attrs.uint16 != lastAttrs.uint16:
         var params: seq[string] = @["0"]  # reset
@@ -959,5 +1061,40 @@ proc renderAnsi*(g: Grid, width, height: int): string =
       else:
         result.add " "
       inc col
+
+proc renderAnsi*(g: Grid, width, height: int): string =
+  ## Render the visible screen (last `height` rows) as ANSI escape
+  ## sequences. Clears screen, moves cursor home, writes rows with
+  ## attributes, resets at end. Rendering the LAST rows, not the first,
+  ## is what makes the render correct for a grid with scrollback: the
+  ## visible screen lives at the tail of `rows`.
+  result = "\x1b[2J\x1b[H"  # clear screen, home cursor
+  let first = max(0, g.rows.len - height)
+  result.add renderRows(g, g.rows[first ..< g.rows.len], width)
   # Reset attributes at end
   result.add "\x1b[0m"
+
+proc renderAnsiFull*(g: Grid): string =
+  ## Render the whole modeled grid — scrollback plus visible screen — as
+  ## one text stream, so a freshly attached terminal receives the session
+  ## history in its own local scrollback. The visible screen is emitted
+  ## with per-cell attributes; scrollback rows are plain text: terminals
+  ## paste scrolled-off history as text, and re-emitting old attributes
+  ## would repaint stale colors across the attach. Ends with a screen
+  ## clear + home so the caller can follow it with live output.
+  result = ""
+  if g.rows.len > g.height and g.height > 0:
+    let first = g.rows.len - g.height
+    for r in 0 ..< first:
+      let line = g.rowText(r)
+      if line.len > 0:
+        result.add line
+      result.add "\r\n"
+  elif g.rows.len > 0 and g.height <= 0:
+    # No screen size known: everything is history.
+    for r in 0 ..< g.rows.len:
+      let line = g.rowText(r)
+      if line.len > 0:
+        result.add line
+      result.add "\r\n"
+  result.add renderAnsi(g, g.width, g.height)
